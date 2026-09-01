@@ -94,7 +94,49 @@ Panel {
     return root.connected ? "Connected" : "Disconnected"
   }
 
-  onOpenedChanged: if (opened) refreshNow()
+  onOpenedChanged: {
+    if (opened) refreshNow()
+    root.cursorActive = false
+    // sortedGateways always puts the connected gateway first (index 0),
+    // so index 1 is it -- same convention as the Bluetooth panel opening
+    // with its cursor on the already-connected device instead of always
+    // resetting to the header. Falls back to the header (0) when nothing
+    // is connected, since that's the primary "turn it on" action then.
+    root.cursorIndex = root.connected ? 1 : 0
+  }
+
+  // Keyboard cursor: a single linear index over [header switch, gateway
+  // rows...] -- index 0 is the header/switch, 1..N are root.sortedGateways.
+  // Same convention as the other first-party panels (e.g. Bluetooth): the
+  // first Up/Down just reveals the cursor without moving it, and Space/
+  // Enter is a no-op until the cursor is actually visible (no "invisible
+  // toggle" surprise).
+  property bool cursorActive: false
+  property int cursorIndex: 0
+  readonly property int maxCursorIndex: root.requirementsMet ? root.sortedGateways.length : 0
+
+  function moveCursor(dy) {
+    if (!root.cursorActive) { root.cursorActive = true; return }
+    if (dy === 0) return
+    root.cursorIndex = Math.max(0, Math.min(root.maxCursorIndex, root.cursorIndex + dy))
+  }
+
+  function setCursor(index) {
+    root.cursorActive = true
+    root.cursorIndex = index
+  }
+
+  function activateCursor() {
+    if (!root.cursorActive) return
+    if (root.cursorIndex === 0) {
+      root.toggleDefault()
+      return
+    }
+    var gw = root.sortedGateways[root.cursorIndex - 1]
+    if (!gw) return
+    if (root.connected && root.lastGateway === gw.fqdn) root.disconnect()
+    else root.connectGateway(gw.key)
+  }
 
   // First-use setup prompt: the very first time this plugin ever sees
   // itself with no portal configured, open the popup unprompted instead of
@@ -446,7 +488,8 @@ Panel {
       // inline add-host field -- otherwise arrow/enter/escape get
       // intercepted here before the TextField ever sees them.
       blocked: portalField.activeFocus
-      onActivateRequested: root.refreshNow()
+      onMoveRequested: function(dx, dy) { root.moveCursor(dy) }
+      onActivateRequested: root.activateCursor()
       onCloseRequested: root.close()
 
       Flickable {
@@ -473,21 +516,32 @@ Panel {
             fontFamily: root.fontFamily
 
             trailingControl: Component {
-              ToggleSwitch {
-                checked: root.connected
+              CursorSurface {
+                hasCursor: root.cursorActive && root.cursorIndex === 0
+                implicitWidth: toggle.implicitWidth + Style.space(10)
+                implicitHeight: toggle.implicitHeight + Style.space(6)
                 foreground: root.foreground
-                busy: root.busy
-                interactive: root.connected || root.requirementsMet
-                onToggled: root.toggleDefault()
 
-                PanelToolTip {
-                  visible: parent.containsMouse
-                  text: root.connected
-                    ? "Disconnect"
-                    : (root.defaultGatewayKey() !== ""
-                        ? "Connect to " + root.gatewayLabelForKey(root.defaultGatewayKey())
-                        : "Discover gateways and connect")
-                  fontFamily: root.fontFamily
+                ToggleSwitch {
+                  id: toggle
+                  anchors.centerIn: parent
+                  checked: root.connected
+                  foreground: root.foreground
+                  busy: root.busy
+                  interactive: root.connected || root.requirementsMet
+                  onToggled: root.toggleDefault()
+
+                  onContainsMouseChanged: if (containsMouse) root.setCursor(0)
+
+                  PanelToolTip {
+                    visible: parent.containsMouse
+                    text: root.connected
+                      ? "Disconnect"
+                      : (root.defaultGatewayKey() !== ""
+                          ? "Connect to " + root.gatewayLabelForKey(root.defaultGatewayKey())
+                          : "Discover gateways and connect")
+                    fontFamily: root.fontFamily
+                  }
                 }
               }
             }
@@ -683,20 +737,17 @@ Panel {
 
               ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
-              delegate: Item {
+              delegate: CursorSurface {
                 id: gatewayRow
                 required property var modelData
+                required property int index
                 readonly property bool isCurrent: root.connected && root.lastGateway === modelData.fqdn
                 width: ListView.view.width
                 height: Math.max(Style.space(32), labelColumn.implicitHeight + Style.space(8))
-
-                Rectangle {
-                  anchors.fill: parent
-                  radius: Style.space(4)
-                  color: rowHover.containsMouse
-                    ? Style.hoverFillFor(root.foreground, Color.accent)
-                    : (gatewayRow.isCurrent ? Style.selectedFillFor(root.foreground, Color.accent) : "transparent")
-                }
+                radius: Style.space(4)
+                foreground: root.foreground
+                hasCursor: root.cursorActive && root.cursorIndex === gatewayRow.index + 1
+                current: gatewayRow.isCurrent
 
                 Column {
                   id: labelColumn
@@ -744,7 +795,18 @@ Panel {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
+                  onContainsMouseChanged: if (containsMouse) root.setCursor(gatewayRow.index + 1)
                   onClicked: gatewayRow.isCurrent ? root.disconnect() : root.connectGateway(gatewayRow.modelData.key)
+                }
+              }
+
+              // Keep the keyboard cursor in view when it moves into/through
+              // the gateway list -- ListView doesn't do this on its own
+              // since nothing sets its built-in currentIndex here.
+              Connections {
+                target: root
+                function onCursorIndexChanged() {
+                  if (root.cursorIndex > 0) gatewayList.positionViewAtIndex(root.cursorIndex - 1, ListView.Contain)
                 }
               }
             }
