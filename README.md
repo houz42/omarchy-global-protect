@@ -100,6 +100,23 @@ still exists for CLI use, but the plugin itself no longer calls it.
 `refreshIntervalSec` (default `15`) -- set via
 `omarchy bar set houz42.global-protect refreshIntervalSec <seconds>`.
 
+## Removal
+
+```bash
+omarchy plugin remove houz42.global-protect
+```
+
+This removes the plugin itself but, since they live outside the plugin's
+own directory, does **not** touch:
+
+- The routing hook at `/etc/vpnc/gp-wrapper-vpnc-script` (root-owned) --
+  remove with `sudo rm /etc/vpnc/gp-wrapper-vpnc-script`.
+- Your saved portal/state: `~/.config/houz42-global-protect/` and
+  `~/.cache/houz42-global-protect/`.
+- The `gpclient`/`vpnc` packages themselves, in case you still want them.
+
+Disconnect first if a tunnel is up (the popup's switch) before removing.
+
 ## License
 
 [MIT](LICENSE)
