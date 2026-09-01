@@ -1,0 +1,12 @@
+#!/bin/bash
+# Prints the gateway list as JSON: [{"key":...,"fqdn":...,"label":...}, ...]
+# Reads the cache file `gp-wrapper discover` maintains directly -- no
+# separate caching here, always a fresh read.
+
+set -u
+
+GATEWAYS_FILE="${XDG_CACHE_HOME:-${HOME}/.cache}/houz42-global-protect/gateways.tsv"
+
+[[ -f "$GATEWAYS_FILE" ]] || { echo "[]"; exit 0; }
+
+jq -R 'split("|") | {key: .[0], label: .[1], fqdn: .[2]}' "$GATEWAYS_FILE" | jq -sc .

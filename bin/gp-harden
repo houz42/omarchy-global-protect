@@ -1,0 +1,9 @@
+#!/bin/bash
+# Action handler for the "Re-harden" button in the GlobalProtect VPN popup.
+# Re-applies the anti-GFW hardening (DNS routing domain + IPv6 disable on
+# the uplink) to an already-up tunnel, e.g. after a suspend/resume that
+# rebuilt the link.
+
+set -u
+BIN_DIR="$(dirname "${BASH_SOURCE[0]}")"
+exec "${BIN_DIR}/gp-wrapper" harden

@@ -1,0 +1,1041 @@
+#!/usr/bin/env bash
+# Bundled with the houz42.global-protect Omarchy plugin. This is the
+# canonical copy -- the plugin calls it directly by path, so it does not
+# need to be on PATH. Copy it to ~/.local/bin/gp-wrapper yourself if you
+# also want the `gp-wrapper` command available in a shell.
+#
+# Convenience wrapper around `gpclient` for any GlobalProtect VPN portal,
+# with a routing-conflict warning hook applied (see gp-wrapper-vpnc-
+# script, installed to /etc/vpnc/) and mako notifications.
+#
+# Portal: read from $GP_PORTAL if set, else from the config file at
+# ${XDG_CONFIG_HOME:-~/.config}/houz42-global-protect/portal.conf (one line,
+# the portal hostname). Neither set -> error, see below.
+#
+# Gateway handling: gpclient compares --gateway against the portal's
+# advertised <description> ("name") OR <address> (FQDN). Both are exact
+# string match, case-sensitive (see crates/gpapi/src/portal/config.rs).
+# This script does not hardcode any portal's gateway list -- run
+# `gp-wrapper discover` once (live portal fetch, needs SSO) to populate
+# it, then `gp-wrapper list` any time to see what was discovered.
+#
+# Usage:
+#   gp-wrapper                 # menu: pick a gateway from the discovered list, then connect
+#   gp-wrapper <name>          # connect directly by fuzzy name/substring
+#   gp-wrapper -g <name|fqdn>  # connect to specific gateway by exact name OR FQDN
+#   gp-wrapper menu            # show the discovered gateway menu without connecting
+#   gp-wrapper discover        # (slow) fetch gateway names+FQDNs live from the portal
+#   gp-wrapper list            # print the currently discovered gateway list
+#   gp-wrapper restart [name]  # force a fresh connection to the given (or last-used) gateway
+#   gp-wrapper disconnect      # disconnect (restores IPv6 on the physical uplink)
+#   gp-wrapper harden          # re-apply anti-GFW hardening to an already-up tunnel
+#   gp-wrapper status          # show tunnel state
+#   gp-wrapper resume          # send SIGUSR2 to gpservice to resume after suspend
+#   gp-wrapper gui             # launch tray GUI (gpgui)
+#   gp-wrapper help            # show this header
+#
+# Auto-connect:
+#   Hyprland exec-once = uwsm-app -- ~/.local/bin/gp-wrapper-autoconnect
+#   /etc/systemd/system-sleep/gp-wrapper-resume  (post-suspend, calls `gp-wrapper resume`)
+#
+# Anti-GFW hardening (applied automatically on connect, undone on disconnect):
+#   1. SINGLETON  - refuses to run two gpclient sessions at once. Two sessions
+#      run two vpnc-scripts against one routing table; the loser can delete the
+#      winner's gateway host-route exclusion, so the gateway IP starts routing
+#      INTO the tunnel. That recursive loop shipped 42 GB / 69.6M packets in
+#      ~9 minutes and killed all egress (incident 2026-08-03).
+#   2. DNS        - adds the '~.' catch-all routing domain to the tunnel link so
+#      systemd-resolved stops racing the ISP resolver, which answers ~87x faster
+#      with GFW-injected addresses (docs.google.com -> a Facebook netblock).
+#   3. IPv6       - disables IPv6 on the physical uplink only. The VPN is
+#      IPv4-only, so Happy Eyeballs otherwise sends every dual-stack request out
+#      over the China v6 path, bypassing the tunnel completely. Scoped to the
+#      uplink so other tools relying on the host's own IPv6 keep working.
+# Run `gp-wrapper harden` by hand if a resume rebuilt the link and DNS regressed.
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/houz42-global-protect"
+PORTAL_FILE="${CONFIG_DIR}/portal.conf"
+PORTAL="${GP_PORTAL:-}"
+if [[ -z "${PORTAL}" && -f "${PORTAL_FILE}" ]]; then
+  PORTAL="$(tr -d '[:space:]' <"${PORTAL_FILE}")"
+fi
+
+SCRIPT=/etc/vpnc/gp-wrapper-vpnc-script
+GPSERVICE_PIDFILE=/tmp/gpservice_disconnected.pid
+GPCLIENT_LOCK=/var/run/gpclient.lock
+# Persistent portal cookie cache. gpclient runs as root (via sudo), so this
+# root-owned path keeps a reusable gateway auth_cookie: reconnects skip the SAML
+# browser step while the gateway cookie is still valid server-side (typically a
+# day or two), then fall back to browser auth automatically. It holds a live
+# session token, so the dir is 0700 and the file must never be committed.
+COOKIE_CACHE=/var/cache/gpclient/cookie.json
+# Persisted state so the non-TTY resume path knows which gateway to
+# reconnect to (gpclient's picker needs a TTY; resume has none).
+STATE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/houz42-global-protect"
+LAST_GATEWAY_FILE="${STATE_DIR}/last-gateway"
+RESUME_LOCK=/tmp/gp-wrapper-resume.lock
+
+# In-progress action, for the plugin panel to show live status/icon state
+# without needing a terminal for visibility (`idle|discovering|connecting`,
+# one epoch-seconds timestamp + one word). gp-status treats it as stale
+# past ACTION_STATUS_TTL so a crashed/killed wrapper can't wedge the UI in
+# "Connecting..." forever.
+ACTION_STATUS_FILE="${STATE_DIR}/action-status"
+_set_action_status() {
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  printf '%s %s\n' "$(date +%s)" "${1}" >"${ACTION_STATUS_FILE}.tmp" 2>/dev/null \
+    && mv "${ACTION_STATUS_FILE}.tmp" "${ACTION_STATUS_FILE}" 2>/dev/null || true
+}
+
+# Detached watcher: flips the action status back to idle once the tunnel
+# actually comes up (gp-status's own `connected` becomes the source of
+# truth from then on) or after a bounded timeout if it never does. Mirrors
+# _harden_when_up's detached-subshell pattern below, for the same reason:
+# `_connect_gateway` execs into gpclient, so nothing after the exec can
+# ever run to clear this itself.
+_watch_connect_status() {
+  # _watch_connect_status [log-file]
+  #
+  # If a log file is given, once the tunnel comes up, also work out and
+  # persist whichever gateway the connect actually landed on. This matters
+  # for connect-auto: --auto-gateway means the caller never knew the target
+  # gateway in advance, and a still-valid cached cookie makes gpclient skip
+  # straight to whatever gateway THAT cookie remembers -- which can silently
+  # differ from both the previous last-gateway AND from genuine priority-
+  # order auto-selection. Without this, last-gateway (and so the gateway
+  # list's "currently connected" checkmark) goes stale/wrong.
+  local log="${1:-}"
+  (
+    local actual_gw
+    local seen_gpclient=""
+    # 900 * 1s = 15 min bound. SSO isn't just "the SAML round-trip" -- it's
+    # bounded by how long the user takes to notice the browser popup and
+    # click through it, which can easily run several minutes. Confirmed
+    # live 2026-09-01: a real login took 8 minutes and got a false "timed
+    # out" notification under the previous 3-minute bound, well before the
+    # (otherwise entirely successful) connect actually finished.
+    for _i in $(seq 1 900); do
+      if _tunnel_alive; then
+        if [[ -n "${log}" ]]; then
+          actual_gw="$(command grep -oE 'SSL negotiation with [A-Za-z0-9.-]+' "${log}" 2>/dev/null | tail -1 | awk '{print $NF}')"
+          if [[ -n "${actual_gw}" ]]; then
+            _persist_gateway "${actual_gw}"
+            # Cookie-reuse can also skip the portal config fetch entirely,
+            # so the background gateway-list parser in connect-auto may
+            # never see a list to cache. Seed at least this one entry so
+            # the gateway list isn't left empty/stale -- a real `discover`
+            # or a future cookie-expired connect-auto will overwrite it
+            # with the full, properly-labeled list.
+            if [[ ! -s "${GATEWAYS_FILE}" ]]; then
+              mkdir -p "${STATE_DIR}"
+              printf '%s|%s|%s\n' "${actual_gw//./}" "${actual_gw}" "${actual_gw}" >"${GATEWAYS_FILE}"
+            fi
+          fi
+        fi
+        _set_action_status idle
+        exit 0
+      fi
+      # gpclient died before the tunnel ever came up (auth/config error) --
+      # this is the only failure signal a headless (no terminal) connect
+      # gets, so surface it as a notification instead of just quietly
+      # reverting to "Disconnected". Only counts once we've actually SEEN
+      # it alive first -- this watcher is started just before the exec
+      # that launches gpclient, so on the very first tick or two it may
+      # genuinely not exist yet (still inside `sudo`'s own startup), which
+      # isn't a failure, just not started yet.
+      if [[ -n "$(_live_gpclient_pids)" ]]; then
+        seen_gpclient=1
+      elif [[ -n "${seen_gpclient}" ]]; then
+        _set_action_status idle
+        _notify critical "VPN connect failed" "gpclient exited before the tunnel came up."
+        exit 0
+      fi
+      sleep 1
+    done
+    _set_action_status idle
+    _notify critical "VPN connect timed out" "No tunnel after 15 minutes."
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# Discovered gateway list, one per line: key|description|fqdn. Written by
+# `gp-wrapper discover` (live portal fetch); read into GATEWAYS below.
+# `key` is a slug derived from the description, for fuzzy matching.
+GATEWAYS_FILE="${STATE_DIR}/gateways.tsv"
+GATEWAYS=()
+_load_gateways() {
+  GATEWAYS=()
+  [[ -f "${GATEWAYS_FILE}" ]] || return 0
+  local line
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    GATEWAYS+=("${line}")
+  done <"${GATEWAYS_FILE}"
+}
+_load_gateways
+
+_require_portal() {
+  if [[ -z "${PORTAL}" ]]; then
+    echo "gp-wrapper: no portal configured. Set \$GP_PORTAL or write your portal" >&2
+    echo "hostname to ${PORTAL_FILE} (one line, e.g. gp.example.com)." >&2
+    exit 1
+  fi
+}
+
+_require_gateways() {
+  if [[ "${#GATEWAYS[@]}" -eq 0 ]]; then
+    echo "gp-wrapper: no gateways discovered yet. Run 'gp-wrapper discover' first." >&2
+    exit 1
+  fi
+}
+
+# --- helpers ---------------------------------------------------------------
+
+_notify() {
+  # _notify <urgency> <summary> [body]
+  local urgency="${1}" summary="${2}" body="${3:-}"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a gp-wrapper -u "${urgency}" -i network-vpn "${summary}" "${body}" || true
+  fi
+}
+
+_tunnel_iface() {
+  ip -br link show 2>/dev/null \
+    | awk '$1 ~ /^(gpd|tun)/ {print $1; exit}'
+}
+
+_gw_field() {
+  # _gw_field <index 1-based> <field 1=key|2=desc|3=fqdn>
+  # `10#` forces base-10: a plain `$(( $1 - 1 ))` on a leading-zero index
+  # like "08" hits bash's octal parsing and throws "value too great for
+  # base" instead of just being a normal number.
+  local entry="${GATEWAYS[$(( 10#$1 - 1 ))]}"
+  cut -d'|' -f"$2" <<<"${entry}"
+}
+
+_print_menu() {
+  # Numbered, human-readable gateway menu on stderr (so stdout stays clean).
+  local i=1 key desc fqdn
+  for entry in "${GATEWAYS[@]}"; do
+    IFS='|' read -r key desc fqdn <<<"${entry}"
+    printf '  %d) %-24s %-8s %s\n' "${i}" "${desc}" "[${key}]" "${fqdn}" >&2
+    (( i++ ))
+  done
+}
+
+_resolve_gateway() {
+  # Resolve a user token to a gateway FQDN. Matches (case-insensitive), in order:
+  #   1) menu number (1..N)
+  #   2) exact key / description / fqdn
+  #   3) unique substring of key / description / fqdn
+  # Prints the FQDN on stdout and returns 0, or prints nothing and returns 1.
+  local token="${1}" i=1 key desc fqdn
+  local lc="${token,,}"
+
+  # 0) empty token never matches (avoids the substring loop matching all)
+  [[ -z "${token}" ]] && return 1
+
+  # 1) numeric selection
+  if [[ "${token}" =~ ^[0-9]+$ ]]; then
+    # 10# forces base-10 -- a bare `(( token >= 1 ))` on a leading-zero
+    # token like "08" hits bash's octal parsing and crashes the whole
+    # script under set -e instead of falling through to "invalid selection".
+    if (( 10#${token} >= 1 && 10#${token} <= ${#GATEWAYS[@]} )); then
+      _gw_field "${token}" 3
+      return 0
+    fi
+    return 1
+  fi
+
+  # 2) exact match on key / description / fqdn
+  for entry in "${GATEWAYS[@]}"; do
+    IFS='|' read -r key desc fqdn <<<"${entry}"
+    if [[ "${lc}" == "${key,,}" || "${lc}" == "${desc,,}" || "${lc}" == "${fqdn,,}" ]]; then
+      printf '%s\n' "${fqdn}"
+      return 0
+    fi
+  done
+
+  # 3) unique substring match
+  local matches=()
+  for entry in "${GATEWAYS[@]}"; do
+    IFS='|' read -r key desc fqdn <<<"${entry}"
+    if [[ "${key,,}" == *"${lc}"* || "${desc,,}" == *"${lc}"* || "${fqdn,,}" == *"${lc}"* ]]; then
+      matches+=("${fqdn}")
+    fi
+  done
+  if (( ${#matches[@]} == 1 )); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  elif (( ${#matches[@]} > 1 )); then
+    echo "gp-wrapper: '${token}' is ambiguous, matches ${#matches[@]} gateways:" >&2
+    printf '  %s\n' "${matches[@]}" >&2
+    return 2
+  fi
+  return 1
+}
+
+_extract_gateways_from_log() {
+  # _extract_gateways_from_log <log-file>
+  # Prints deduped "fqdn|desc" pairs parsed from gpclient's verbose debug
+  # log (shared by `discover` and `connect-auto` -- both scrape a live
+  # gpclient session's own log for this, just via different sessions).
+  # The portal advertises each gateway twice (once keyed by FQDN, once by
+  # description); keep only the FQDN-keyed entry (the name contains a dot
+  # and no spaces) so each gateway appears once.
+  awk '
+    /<entry[ \t]+name="/ {
+      line = $0
+      start = index(line, "name=\"") + 6
+      rest = substr(line, start)
+      endq = index(rest, "\"")
+      fqdn = substr(rest, 1, endq - 1)
+      next
+    }
+    /<description>/ && fqdn != "" {
+      line = $0
+      start = index(line, "<description>") + length("<description>")
+      rest = substr(line, start)
+      endtag = index(rest, "</description>")
+      if (endtag > 0) {
+        desc = substr(rest, 1, endtag - 1)
+        if (desc != "" && fqdn ~ /\./ && fqdn !~ / /) print fqdn "|" desc
+        fqdn = ""
+      }
+    }
+  ' "${1}" | sort -u
+}
+
+_save_gateways() {
+  # _save_gateways <<<"fqdn|desc pairs, one per line (via stdin)"
+  # Derives the fuzzy-match `key` for each and writes GATEWAYS_FILE
+  # atomically. Caller is expected to _load_gateways afterward.
+  #
+  # GATEWAYS_FILE itself is key|desc|fqdn (3 fields, desc in the MIDDLE),
+  # unlike the fqdn|desc stdin format above (desc LAST, where bash's `read`
+  # harmlessly folds any embedded '|' into it). A '|' in a portal's
+  # <description> would otherwise silently produce a 4+-field row here,
+  # which every downstream `IFS='|' read -r key desc fqdn` (and
+  # gp-gateways's `split("|")`) mis-slices -- corrupting fqdn with part of
+  # desc, i.e. clicking one gateway could silently connect to a different
+  # one. Strip it rather than support escaping a format nothing else here
+  # needs to be more expressive than "a label".
+  local fqdn desc key
+  mkdir -p "${STATE_DIR}"
+  {
+    while IFS='|' read -r fqdn desc; do
+      desc="${desc//|/ }"
+      key="$(printf '%s' "${desc}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+//g')"
+      printf '%s|%s|%s\n' "${key}" "${desc}" "${fqdn}"
+    done
+  } >"${GATEWAYS_FILE}.tmp"
+  mv "${GATEWAYS_FILE}.tmp" "${GATEWAYS_FILE}"
+}
+
+_ensure_cookie_cache_dir() {
+  # gpclient writes COOKIE_CACHE as root; make sure its dir exists and is 0700
+  # (the file holds a live gateway session token).
+  local dir; dir="$(dirname "${COOKIE_CACHE}")"
+  sudo mkdir -p "${dir}" 2>/dev/null || true
+  sudo chmod 0700 "${dir}" 2>/dev/null || true
+}
+
+_clear_stale_cookie() {
+  # _clear_stale_cookie <target-gateway-fqdn>
+  #
+  # gpclient's cookie cache (StoredCookie) carries last_gateway, and
+  # try_cached_cookie uses THAT value, ignoring --gateway. When the
+  # cached gateway disagrees with our target, delete the cookie so
+  # gpclient does fresh SAML auth to the correct gateway.
+  #
+  # Read the root-owned cookie file with sudo; parse last_gateway with jq.
+  # A missing/unparseable cookie is harmless — skip deletion.
+  #
+  # The EXISTENCE check must also go through sudo: /var/cache/gpclient is
+  # 0700 root:root, so a plain `[[ -f "${COOKIE_CACHE}" ]]` as this
+  # (unprivileged) user can't even traverse into the directory and always
+  # silently evaluates false -- which meant this whole function was
+  # permanently a no-op, defeating the one thing it exists to do. Confirmed
+  # live 2026-09-01: a gateway click for gp-bei-cn actually connected to
+  # gp-zj-cn (the stale cookie's remembered gateway) because of this.
+  local target="${1}"
+  [[ -z "${target}" ]] && return 0
+  if sudo test -f "${COOKIE_CACHE}" 2>/dev/null; then
+    local cookie_gw
+    cookie_gw="$(sudo cat "${COOKIE_CACHE}" 2>/dev/null | jq -r '.last_gateway' 2>/dev/null || true)"
+    if [[ -n "${cookie_gw}" && "${target}" != "${cookie_gw}" ]]; then
+      sudo rm -f "${COOKIE_CACHE}" 2>/dev/null || true
+      log_msg "cookie: cleared (cookie said ${cookie_gw}, target is ${target})"
+    fi
+  fi
+}
+
+_persist_gateway() {
+  # Record the last-connected gateway FQDN so `gp-wrapper resume` (non-TTY) can
+  # reconnect to the same gateway without the interactive picker.
+  local gw="${1}"
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  printf '%s\n' "${gw}" > "${LAST_GATEWAY_FILE}" 2>/dev/null || true
+}
+
+_harden_when_up() {
+  # Apply the anti-GFW hardening as soon as the tunnel appears, in the
+  # background.
+  #
+  # The connect paths `exec` into gpclient, so this process is REPLACED and can
+  # never run post-connect code itself. Detaching a watcher is the only way to
+  # harden automatically; without it the user must remember `gp-wrapper harden`.
+  # Bounded so a failed/cancelled connect cannot leave it spinning forever.
+  # Capture the physical uplink NOW, before the tunnel installs its own default
+  # route. Once tun0 is up, `_phys_iface` may no longer be able to name it.
+  local phys; phys="$(_phys_iface)"
+  (
+    local i iface
+    for i in $(seq 1 120); do            # 120 * 1s = 2 min for SAML + tunnel up
+      iface="$(_tunnel_iface)"
+      if [[ -n "${iface}" ]] && _tunnel_alive; then
+        _harden_dns "${iface}"
+        _harden_ipv6 "${phys}"
+        exit 0
+      fi
+      sleep 1
+    done
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+_connect_gateway() {
+  # _connect_gateway <fqdn>
+  local gw="${1}"
+  # SINGLETON: never leave a second gpclient running (see _ensure_single_session).
+  _ensure_single_session "${gw}"
+  # gpclient's try_cached_cookie uses the stored last_gateway, ignoring
+  # --gateway. Clear the cookie if it names a different gateway than ours.
+  _clear_stale_cookie "${gw}"
+  _persist_gateway "${gw}"
+  _ensure_cookie_cache_dir
+  _harden_when_up
+  _set_action_status connecting
+  _watch_connect_status
+  exec sudo gpclient connect "${PORTAL}" \
+    --script "${SCRIPT}" \
+    --cookie-cache "${COOKIE_CACHE}" \
+    --default-browser \
+    --gateway "${gw}"
+}
+
+_have_default_route() {
+  ip route show default 2>/dev/null | grep -q '^default'
+}
+
+_wait_for_uplink() {
+  # Wi-Fi often takes a few seconds to re-associate after s2idle. Wait (bounded)
+  # for a default route before touching the VPN. Returns 0 if up, 1 on timeout.
+  local i
+  for i in $(seq 1 20); do          # 20 * 0.5s = 10s max
+    _have_default_route && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+_tunnel_alive() {
+  # True only if the tunnel interface exists AND actually carries traffic.
+  # iface-UP alone is unreliable after s2idle (shows UP on a dead tunnel),
+  # so ping a host that is ONLY reachable through the GP tunnel.
+  #
+  # The targets are whatever internal DNS server(s) THIS session's own
+  # tunnel pushed, read live via `resolvectl dns <iface>` -- NOT a hardcoded
+  # IP. Those addresses are portal-issued (systemd-resolved just reports
+  # back whatever the vpnc-script configured for this link), so this works
+  # for any org's GlobalProtect deployment, not just the one the plugin
+  # happened to be tested against.
+  local iface targets tgt
+  iface="$(_tunnel_iface)"
+  [[ -z "${iface}" ]] && return 1
+  targets=""
+  if command -v resolvectl >/dev/null 2>&1; then
+    targets="$(resolvectl dns "${iface}" 2>/dev/null | sed -E 's/^Link [0-9]+ \([^)]*\)://')"
+  fi
+  if [[ -z "${targets}" ]]; then
+    # Too early for resolvectl to have anything yet (DNS is pushed as part
+    # of bringing the link up, essentially alongside the interface itself)
+    # -- fall back to "interface has a default route", the best available
+    # signal until a DNS server shows up to ping.
+    ip route show default dev "${iface}" 2>/dev/null | grep -q .
+    return $?
+  fi
+  for tgt in ${targets}; do
+    if ping -c 1 -W 2 -I "${iface}" "${tgt}" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+_kill_stale_gpclient() {
+  # After a clean `gpclient disconnect`, if a stale connect process still holds
+  # /var/run/gpclient.lock, kill it (guarded by /proc/<pid>/comm to avoid PID
+  # reuse) and remove the lock so a fresh connect won't hit "already running".
+  local pid
+  [[ -f "${GPCLIENT_LOCK}" ]] || return 0
+  pid="$(sudo cat "${GPCLIENT_LOCK}" 2>/dev/null | tr -dc '0-9')"
+  if [[ -n "${pid}" ]] && grep -qi gpclient "/proc/${pid}/comm" 2>/dev/null; then
+    sudo kill -9 "${pid}" 2>/dev/null || true
+    sleep 1
+  fi
+  # Remove the lock only if no live gpclient still owns it.
+  if [[ -f "${GPCLIENT_LOCK}" ]]; then
+    pid="$(sudo cat "${GPCLIENT_LOCK}" 2>/dev/null | tr -dc '0-9')"
+    if [[ -z "${pid}" ]] || ! grep -qi gpclient "/proc/${pid}/comm" 2>/dev/null; then
+      sudo rm -f "${GPCLIENT_LOCK}" 2>/dev/null || true
+    fi
+  fi
+}
+
+_phys_iface() {
+  # The physical uplink carrying the default route (i.e. not the VPN tunnel).
+  ip route show default 2>/dev/null \
+    | awk '{for (i=1; i<=NF; i++) if ($i=="dev" && $(i+1) !~ /^(tun|gpd)/) {print $(i+1); exit}}'
+}
+
+_harden_dns() {
+  # Make the VPN resolver AUTHORITATIVE for every name.
+  #
+  # systemd-resolved marks both tun0 and the Wi-Fi link "Default Route: yes".
+  # A name matching no routing domain is therefore asked on BOTH links and the
+  # FIRST answer wins. In mainland China the ISP resolver answers in ~9ms with
+  # GFW-injected garbage while the VPN resolver takes ~780ms with the truth, so
+  # the poisoned answer wins every race and gets cached. Measured 2026-08-03:
+  #   docs.google.com -> 31.13.94.36   (Facebook netblock) via wlan0   [poison]
+  #   docs.google.com -> 142.250.197.78 (real Google)      via tun0    [truth]
+  # Adding the '~.' catch-all routing domain to the tunnel makes resolved send
+  # ALL queries there, so the ISP resolver is never consulted.
+  #
+  # Trade-off: local .lan/mDNS-style names stop resolving while connected, and
+  # every query is visible to the corporate resolver. Both are acceptable here.
+  local iface="${1}"
+  [[ -z "${iface}" ]] && return 0
+  command -v resolvectl >/dev/null 2>&1 || return 0
+  local existing
+  existing="$(resolvectl domain "${iface}" 2>/dev/null \
+              | sed -E 's/^Link [0-9]+ \([^)]*\)://' | tr -s ' \n' ' ' \
+              | sed 's/^ *//; s/ *$//')"
+  case " ${existing} " in
+    *" ~. "*) return 0 ;;                      # already authoritative
+  esac
+  # shellcheck disable=SC2086
+  sudo resolvectl domain "${iface}" '~.' ${existing} 2>/dev/null || true
+  sudo resolvectl flush-caches 2>/dev/null || true
+  log_msg "DNS: ${iface} is now the catch-all resolver (GFW poison bypassed)"
+}
+
+_harden_ipv6() {
+  # Seal the IPv6 leak on the PHYSICAL uplink only.
+  #
+  # This corporate VPN carries no IPv6: tun0 gets only a link-local address and
+  # there is no v6 default route through it. The host still holds a global
+  # China-ISP v6 address, so Happy Eyeballs makes Chromium prefer IPv6 for any
+  # dual-stack site -- leaving the tunnel entirely and walking into the GFW.
+  # Verified 2026-08-03: `curl https://ifconfig.me` returned the China v6
+  # address while the v4-only endpoint returned the VPN egress.
+  #
+  # Disabling v6 on the uplink (NOT globally) forces every connection to v4,
+  # which is routed into the tunnel. Scoped to the interface so other tools
+  # relying on the host's own IPv6 (e.g. an overlay network client) keep
+  # working -- a global `all.disable_ipv6=1` would strip that too.
+  #
+  # Route-metric tricks are not viable: the RA-installed default route is
+  # refreshed roughly every 30 minutes and would reclaim precedence.
+  local iface="${1}"
+  [[ -z "${iface}" ]] && return 0
+  sudo sysctl -qw "net.ipv6.conf.${iface}.disable_ipv6=1" 2>/dev/null || true
+  log_msg "IPv6: disabled on ${iface} (leak sealed; VPN is IPv4-only)"
+}
+
+_unharden_ipv6() {
+  # Restore IPv6 on the physical uplink after the VPN goes down.
+  local iface="${1}"
+  [[ -z "${iface}" ]] && return 0
+  sudo sysctl -qw "net.ipv6.conf.${iface}.disable_ipv6=0" 2>/dev/null || true
+  log_msg "IPv6: re-enabled on ${iface}"
+}
+
+log_msg() { printf 'gp-wrapper: %s\n' "$*" >&2; }
+
+_harden_now() {
+  # Idempotent: safe to call whether or not hardening is already applied
+  # (_harden_dns/_harden_ipv6 both no-op cleanly if already set).
+  local iface
+  iface="$(_tunnel_iface)"
+  [[ -z "${iface}" ]] && return 1
+  _harden_dns "${iface}"
+  _harden_ipv6 "$(_phys_iface)"
+  return 0
+}
+
+_disconnect_now() {
+  sudo gpclient disconnect
+  # Undo the connect-time hardening. DNS needs no undo: the '~.' domain lives
+  # on the tunnel link, which disappears with the tunnel. IPv6 was disabled on
+  # the physical uplink, so it must be explicitly restored.
+  _unharden_ipv6 "$(_phys_iface)"
+}
+
+_live_gpclient_pids() {
+  # PIDs of REAL, live `gpclient` processes, one per line.
+  #
+  # Matches by process name (comm == gpclient) via `pgrep -x`, not `pgrep -f
+  # 'gpclient connect'` -- gp-wrapper doesn't always invoke it as that exact
+  # literal adjacency (`gpclient -vv connect ...` for the discover/
+  # connect-auto paths puts a flag in between), so a substring match on that
+  # phrase silently missed those sessions entirely, defeating the singleton-
+  # lock safety net for them specifically. Confirmed live 2026-09-01: 3
+  # gpclient sessions from earlier discover/connect-auto testing sat
+  # undetected (and so never torn down) for the rest of the session.
+  # `pgrep -x` matches comm directly and needs no such assumption. The
+  # explicit /proc/<pid>/comm re-check stays as cheap defense in depth.
+  local p comm
+  for p in $(pgrep -x gpclient 2>/dev/null || true); do
+    [[ "${p}" == "$$" ]] && continue
+    comm="$(cat "/proc/${p}/comm" 2>/dev/null || true)"
+    [[ "${comm}" == "gpclient" ]] && printf '%s\n' "${p}"
+  done
+  return 0
+}
+
+_current_gateway() {
+  # Gateway FQDN of the session we believe is live (best effort): read it from
+  # the running gpclient's own --gateway argument, else the persisted value.
+  local p gw=""
+  for p in $(_live_gpclient_pids); do
+    gw="$(tr '\0' '\n' < "/proc/${p}/cmdline" 2>/dev/null \
+          | awk '/^--gateway$/{getline; print; exit}')" || true
+    if [[ -n "${gw}" ]]; then printf '%s\n' "${gw}"; return 0; fi
+  done
+  [[ -f "${LAST_GATEWAY_FILE}" ]] && cat "${LAST_GATEWAY_FILE}" 2>/dev/null || true
+  return 0
+}
+
+_ensure_single_session() {
+  # _ensure_single_session [target-gateway-fqdn]
+  #
+  # SINGLETON INVARIANT: never allow two concurrent gpclient sessions.
+  #
+  # Each session runs its OWN copy of ${SCRIPT} (the vpnc-script) against the
+  # SAME routing table. They race, and one script's teardown can delete the
+  # other's host-route exclusion for the gateway IP. Once the gateway's own
+  # address routes INTO the tunnel, every encapsulated packet is re-encapsulated
+  # and re-queued -- a recursive routing loop. Observed 2026-08-03 (a 3-day-old
+  # Shanghai session wedged in SAML auth + a fresh Hong Kong connect):
+  # 42 GB / 69.6M packets TX in ~9 minutes, ~9.8M drops, tun0 wedged, all egress
+  # dead until the tunnel was torn down.
+  #
+  # NOTE: this deliberately is NOT a plain `flock` around the connect. sudo
+  # closes inherited file descriptors (closefrom), so a lock fd would be dropped
+  # the instant we `exec sudo gpclient` and would protect nothing. Checking for
+  # a live process is the reliable equivalent.
+  local target="${1:-}"
+  local pids i p cur
+  pids="$(_live_gpclient_pids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  [[ -z "${pids}" ]] && return 0
+
+  if _tunnel_alive; then
+    cur="$(_current_gateway)"
+    if [[ -n "${target}" && -n "${cur}" && "${target}" == "${cur}" ]]; then
+      echo "gp-wrapper: already connected to ${cur} (pid: ${pids}); nothing to do." >&2
+      exit 0
+    fi
+    echo "gp-wrapper: switching gateway${cur:+ from ${cur}}${target:+ to ${target}} -- disconnecting current session (pid: ${pids})..." >&2
+    _clear_stale_cookie "${target}"
+  else
+    echo "gp-wrapper: stale gpclient (pid: ${pids}) with no live tunnel; cleaning up..." >&2
+  fi
+
+  sudo gpclient disconnect >/dev/null 2>&1 || true
+  for i in $(seq 1 10); do                     # 10 * 0.5s = 5s for a clean exit
+    [[ -z "$(_live_gpclient_pids)" ]] && break
+    sleep 0.5
+  done
+  for p in $(_live_gpclient_pids); do          # anything left is wedged: reap it
+    if grep -qi gpclient "/proc/${p}/comm" 2>/dev/null; then
+      sudo kill -9 "${p}" 2>/dev/null || true
+    fi
+  done
+  _kill_stale_gpclient
+  # Never connect while a tunnel device lingers: a new session inheriting a
+  # half-torn-down tun0 is precisely the state that produced the routing loop.
+  for i in $(seq 1 10); do
+    [[ -z "$(_tunnel_iface)" ]] && break
+    sleep 0.5
+  done
+  return 0
+}
+
+# --- subcommands -----------------------------------------------------------
+
+cmd="${1:-menu}"
+case "${cmd}" in
+  menu)
+    # Interactive default: show the discovered gateway list and connect to
+    # the chosen one. Requires a TTY (uses `read`). Non-interactive callers
+    # (the resume path, systemd) must use `connect` or `-g <fqdn>` instead.
+    _require_portal
+    _require_gateways
+    if [[ ! -t 0 ]]; then
+      echo "gp-wrapper: 'menu' needs an interactive terminal; use 'gp-wrapper connect' or 'gp-wrapper -g <fqdn>'" >&2
+      exit 1
+    fi
+    echo "Select a gateway:" >&2
+    _print_menu
+    printf 'Gateway [1-%d, name, or Enter=1]: ' "${#GATEWAYS[@]}" >&2
+    read -r choice
+    choice="${choice:-1}"
+    if fqdn="$(_resolve_gateway "${choice}")"; then
+      _connect_gateway "${fqdn}"
+    else
+      echo "gp-wrapper: invalid selection: ${choice}" >&2
+      exit 1
+    fi
+    ;;
+  connect|up)
+    _require_portal
+    shift || true
+    # An explicitly passed `--gateway <name>` / `-g <name>` ALWAYS wins over the
+    # remembered one. Resolve aliases (e.g. `hongkong`) to the real FQDN and
+    # rewrite the argument list, so gpclient and the singleton guard both see
+    # the same resolved value. Only fall back to the persisted gateway when no
+    # --gateway argument was supplied at all (the resume/systemd path).
+    _args=()
+    _target=""
+    _prev=""
+    for _arg in "$@"; do
+      if [[ "${_prev}" == "--gateway" || "${_prev}" == "-g" ]]; then
+        if _resolved="$(_resolve_gateway "${_arg}")"; then
+          _arg="${_resolved}"
+        fi
+        _target="${_arg}"
+      fi
+      _args+=("${_arg}")
+      _prev="${_arg}"
+    done
+    set -- "${_args[@]+"${_args[@]}"}"
+    if [[ -n "${_target}" ]]; then
+      _persist_gateway "${_target}"
+    else
+      _target="$(cat "${LAST_GATEWAY_FILE}" 2>/dev/null || true)"
+    fi
+    # SINGLETON: this path execs gpclient directly (no _connect_gateway), so it
+    # needs its own guard. Pass the gateway we are actually about to connect to,
+    # so switching gateways tears the old session down instead of short-circuiting.
+    _ensure_single_session "${_target}"
+    # gpclient's try_cached_cookie uses stored.last_gateway, ignoring --gateway.
+    _clear_stale_cookie "${_target}"
+    _ensure_cookie_cache_dir
+    _harden_when_up
+    # exec into gpclient so it becomes the main process. This matters for
+    # systemd Type=simple - the unit's lifetime tracks the tunnel.
+    # gpclient connect runs forever (until disconnect), so we only return
+    # here on failure. NO interactive menu here: this path is used by the
+    # non-TTY resume hook, so it must pass straight through to gpclient
+    # (which auto-picks if 1 gateway, else errors on non-TTY).
+    exec sudo gpclient connect "${PORTAL}" \
+      --script "${SCRIPT}" \
+      --cookie-cache "${COOKIE_CACHE}" \
+      --default-browser \
+      "$@"
+    ;;
+  -g|--gateway)
+    _require_portal
+    shift
+    gw="${1:?gateway name or FQDN required}"
+    # Allow fuzzy aliases here too (e.g. -g shanghai). Fall back to the raw
+    # token if it doesn't match the discovered list (so exact FQDNs still work).
+    resolved="$(_resolve_gateway "${gw}")" && gw="${resolved}"
+    _connect_gateway "${gw}"
+    ;;
+  connect-auto)
+    # The plugin's power switch runs this when it has no gateway list yet
+    # (fresh install, or the cache got cleared): ONE real connect using
+    # gpclient's own --auto-gateway (tries gateways in priority order,
+    # without prompting -- no throwaway "debug fetch, kill it, connect for
+    # real" two-phase dance, and so only one SSO round instead of two).
+    # Its own verbose log carries the same portal config a dedicated
+    # `discover` session would have, so the gateway list gets cached from
+    # it in the background -- gateway-switching in the popup afterward
+    # doesn't need a separate discovery step to have run first.
+    _require_portal
+    _ensure_single_session ""
+    log=/tmp/gp-wrapper-connect.log
+    : >"${log}"
+    _ensure_cookie_cache_dir
+    _harden_when_up
+    _set_action_status connecting
+    _watch_connect_status "${log}"
+    (
+      for i in $(seq 1 60); do
+        grep -q "gateways in portal config" "${log}" 2>/dev/null && break
+        sleep 0.5
+      done
+      parsed="$(_extract_gateways_from_log "${log}")"
+      [[ -n "${parsed}" ]] && _save_gateways <<<"${parsed}"
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    exec sudo RUST_LOG=debug gpclient -vv connect "${PORTAL}" \
+      --script "${SCRIPT}" \
+      --cookie-cache "${COOKIE_CACHE}" \
+      --default-browser \
+      --auto-gateway >"${log}" 2>&1
+    ;;
+  discover)
+    # Live portal fetch: triggers a real SAML/SSO browser round-trip under
+    # sudo and takes ~25s. Only meant to be run by hand in a terminal, not
+    # from a background/UI action -- the plugin itself uses `connect-auto`
+    # above instead, which gets the same gateway list AND ends up connected
+    # in one shot. This is kept around for CLI use: rebuild the cached list
+    # without connecting.
+    #
+    # SINGLETON: this also runs `sudo gpclient connect`, so it is subject to
+    # the exact same two-sessions-fighting-over-one-routing-table risk as a
+    # real connect (see _ensure_single_session's incident note above) --
+    # a cached SSO cookie could let the debug connect below complete a real
+    # SECOND tunnel well within the 25s window before we kill it. Rather
+    # than gamble on timing, tear down any live session first (does NOT
+    # reconnect afterward -- reconnect yourself once discovery finishes).
+    _require_portal
+    _set_action_status discovering
+    if [[ -n "$(_live_gpclient_pids)" ]] || _tunnel_alive; then
+      echo "gp-wrapper: disconnecting current session before discovery (won't reconnect automatically)..." >&2
+      _disconnect_now
+      for i in $(seq 1 10); do                     # 10 * 0.5s = 5s for a clean exit
+        [[ -z "$(_live_gpclient_pids)" && -z "$(_tunnel_iface)" ]] && break
+        sleep 0.5
+      done
+    fi
+    echo "Triggering portal config fetch (browser may open for SAML)..." >&2
+    log=/tmp/gp-wrapper-discover.log
+    # The redirect intentionally runs in THIS (unprivileged) shell, not as
+    # root -- the log needs to stay readable by the calling user without
+    # sudo, since it's parsed straight back below in the same script.
+    # shellcheck disable=SC2024
+    sudo RUST_LOG=debug gpclient -vv connect "${PORTAL}" \
+        --script "${SCRIPT}" \
+        --default-browser >"${log}" 2>&1 &
+    pid=$!
+    # gpclient logs the parsed gateway count as soon as the portal config
+    # arrives, then blocks on its own interactive "which gateway?" picker
+    # (it has no --gateway to disambiguate here, since discovering the list
+    # IS the point). Poll for that log line instead of a blind fixed sleep --
+    # a 25s silent wait right after the user just finished SSO in the
+    # browser looks hung and invites closing the terminal before discovery
+    # (and, for discover-connect, the real connect after it) ever finishes.
+    for i in $(seq 1 50); do                     # 50 * 0.5s = 25s hard cap
+      grep -q "gateways in portal config" "${log}" 2>/dev/null && break
+      sleep 0.5
+    done
+    echo "gp-wrapper: portal config received, extracting gateway list..." >&2
+    sudo kill -INT "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+
+    parsed="$(_extract_gateways_from_log "${log}")"
+
+    if [[ -z "${parsed}" ]]; then
+      echo "gp-wrapper: could not parse any gateways from the portal response." >&2
+      echo "Full debug log: ${log}" >&2
+      echo "Look for: <entry name=\"<FQDN>\"> and <description>...</description>" >&2
+      _set_action_status idle
+      exit 1
+    fi
+
+    _save_gateways <<<"${parsed}"
+
+    count="$(wc -l <"${GATEWAYS_FILE}")"
+    echo "gp-wrapper: discovered ${count} gateway(s), saved to ${GATEWAYS_FILE}" >&2
+    _load_gateways
+    _print_menu
+    _set_action_status idle
+    exit 0
+    ;;
+  list)
+    # Cheap, local: print whatever `discover` last found. No network.
+    _require_gateways
+    _print_menu
+    exit 0
+    ;;
+  disconnect|down|stop)
+    _disconnect_now
+    ;;
+  harden)
+    # Re-apply the anti-GFW hardening to a tunnel that is already up.
+    #
+    # `_connect_gateway` execs into gpclient, so it cannot run these afterwards
+    # itself -- the tunnel does not exist yet at that point. Run this once after
+    # connecting (or any time DNS starts returning poisoned answers again, e.g.
+    # after a resume that rebuilt the link).
+    if ! _harden_now; then
+      echo "gp-wrapper: no tunnel is up; connect first." >&2
+      exit 1
+    fi
+    echo "gp-wrapper: hardening applied (DNS via $(_tunnel_iface), IPv6 off on $(_phys_iface))." >&2
+    ;;
+  restart)
+    # Reconnect, forcing a fresh session even when the requested gateway is the
+    # one already up. A gateway passed here ALWAYS wins over the remembered one;
+    # only with no argument do we fall back to the last-used gateway.
+    #
+    # The explicit disconnect is load-bearing: _ensure_single_session exits 0
+    # ("already connected ... nothing to do") when the target matches the live
+    # session, which would make `gp-wrapper restart` a silent no-op.
+    _require_portal
+    shift || true
+    gw=""
+    if (( $# > 0 )); then
+      gw="$1"
+      if resolved="$(_resolve_gateway "${gw}")"; then
+        gw="${resolved}"
+      fi
+    elif [[ -f "${LAST_GATEWAY_FILE}" ]]; then
+      gw="$(cat "${LAST_GATEWAY_FILE}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${gw}" ]]; then
+      echo "gp-wrapper: restart needs a gateway (pass one, or connect once first)" >&2
+      exit 1
+    fi
+    echo "gp-wrapper: restarting on ${gw}..." >&2
+    sudo gpclient disconnect >/dev/null 2>&1 || true
+    _kill_stale_gpclient
+    _connect_gateway "${gw}"
+    ;;
+  resume)
+    # Triggered post-suspend by /etc/systemd/system-sleep/gp-wrapper-resume.
+    #
+    # Serialize against a racing manual `gp-wrapper` (the sleep hook runs us via
+    # `su -l` in the background right when the user might also reconnect by
+    # hand). Non-blocking: if another resume/connect already holds the lock,
+    # just bail — that instance will bring the tunnel up.
+    if [[ -z "${PORTAL}" ]]; then
+      # Unattended path -- skip quietly rather than error loudly.
+      exit 0
+    fi
+    exec 9>"${RESUME_LOCK}"
+    if ! flock -n 9; then
+      _notify low "VPN resume skipped" "Another gp-wrapper instance is already reconnecting"
+      exit 0
+    fi
+
+    # (1) Fast path: paid gpgui/gpservice stack paused the tunnel on sleep.
+    # Only valid if gpservice is ACTUALLY running (bare CLI never writes this).
+    if [[ -f "${GPSERVICE_PIDFILE}" ]]; then
+      pid="$(cat "${GPSERVICE_PIDFILE}" 2>/dev/null)"
+      if [[ -n "${pid}" ]] && ps -p "${pid}" -o comm= 2>/dev/null | grep -q gpservice; then
+        sudo rm -f "${GPSERVICE_PIDFILE}"
+        sudo kill -USR2 "${pid}" 2>/dev/null || true
+        _notify low "VPN resuming" "Sent SIGUSR2 to gpservice (pid ${pid})"
+        exit 0
+      fi
+    fi
+
+    # (2) Wait for the network uplink to come back (Wi-Fi re-associate).
+    if ! _wait_for_uplink; then
+      _notify normal "VPN resume deferred" "No network uplink after resume"
+      exit 0
+    fi
+
+    # (3) If the tunnel actually survived the suspend (short s2idle) and still
+    # carries traffic, never drop a working tunnel -- but the network link
+    # underneath it was still rebuilt, which is exactly what regresses DNS
+    # to a poisoned/wrong resolver (previously a "run harden by hand"
+    # manual step). Re-harden automatically since it's idempotent and cheap.
+    if _tunnel_alive; then
+      _harden_now || true
+      _notify low "VPN still up" "Tunnel survived suspend; re-hardened DNS/IPv6"
+      exit 0
+    fi
+
+    # (4) CLI reality: the tunnel is dead but a stale gpclient + lock linger.
+    # Cleanly tear down, kill any stale holder, then reconnect to the SAME
+    # gateway (silent if the SAML cookie is still valid; browser MFA otherwise).
+    sudo gpclient disconnect >/dev/null 2>&1 || true
+    _kill_stale_gpclient
+    gw=""
+    [[ -f "${LAST_GATEWAY_FILE}" ]] && gw="$(cat "${LAST_GATEWAY_FILE}" 2>/dev/null)"
+
+    # SINGLETON: _kill_stale_gpclient only reaps the PID recorded in
+    # ${GPCLIENT_LOCK}. A session still wedged in gpauth/SAML never wrote that
+    # pidfile, so it survives both the disconnect and the reap -- which is
+    # exactly how the 3-day-old session outlived a reconnect and produced the
+    # routing loop. _ensure_single_session matches on live /proc, so it catches
+    # that case too. Must run AFTER ${gw} is read so it can name the target.
+    # We only reach here when _tunnel_alive already failed, so it takes the
+    # "stale" cleanup branch rather than the "already connected" exit.
+    _ensure_single_session "${gw}"
+
+    # Re-import the user session env so gpauth's browser child can open for MFA
+    # (mirrors gp-wrapper-autoconnect). Harmless when the cookie is still valid.
+    #
+    # Not `eval`: these values normally come straight from the session
+    # manager and are simple strings, but `eval`-ing external command
+    # output executes anything containing shell metacharacters if that
+    # ever stops being true. `export "KEY=VALUE"` as a single argument
+    # sets the exact string with no re-interpretation -- same result,
+    # without depending on the values staying benign.
+    while IFS='=' read -r _env_key _env_val; do
+      [[ -n "${_env_key}" ]] && export "${_env_key}=${_env_val}"
+    done < <(systemctl --user show-environment 2>/dev/null \
+            | grep -E '^(DISPLAY|WAYLAND_DISPLAY|XDG_RUNTIME_DIR|XDG_SESSION_TYPE|DBUS_SESSION_BUS_ADDRESS|XAUTHORITY)=')
+    PRESERVE=DISPLAY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,XDG_SESSION_TYPE,DBUS_SESSION_BUS_ADDRESS,XAUTHORITY
+
+    if [[ -n "${gw}" ]]; then
+      _persist_gateway "${gw}"
+      _ensure_cookie_cache_dir
+      _harden_when_up
+      _notify low "VPN reconnecting" "Gateway: ${gw}"
+      exec setsid sudo --preserve-env="${PRESERVE}" \
+        gpclient connect "${PORTAL}" \
+          --script "${SCRIPT}" \
+          --cookie-cache "${COOKIE_CACHE}" \
+          --default-browser \
+          --gateway "${gw}" </dev/null
+    else
+      # No persisted gateway (never connected via gp-wrapper since this change).
+      # Cannot pick non-interactively across 4 gateways; tell the user.
+      _notify normal "VPN reconnect needs a gateway" \
+        "Run 'gp-wrapper <gateway>' once so resume can remember it"
+      exit 1
+    fi
+    ;;
+  status)
+    iface="$(_tunnel_iface)"
+    if [[ -n "${iface}" ]]; then
+      addr="$(ip -4 -br addr show "${iface}" 2>/dev/null | awk '{print $3}')"
+      echo "GP tunnel UP: ${iface} ${addr}"
+    else
+      echo "GP tunnel DOWN"
+    fi
+    ;;
+  gui)
+    shift || true
+    exec gpclient launch-gui "$@"
+    ;;
+  -h|--help|help)
+    # Print the whole leading comment block (everything up to the first
+    # non-comment line), minus the shebang. Derived rather than hardcoded so
+    # editing the header can never silently truncate `gp-wrapper help` again.
+    awk 'NR==1 && /^#!/ {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+    exit 0
+    ;;
+  *)
+    # Treat any other single token as a gateway name/alias and connect.
+    # e.g. `gp-wrapper shanghai`, `gp-wrapper 2`.
+    _require_portal
+    if fqdn="$(_resolve_gateway "${cmd}")"; then
+      _connect_gateway "${fqdn}"
+    else
+      echo "gp-wrapper: unknown command or gateway: ${cmd}" >&2
+      echo "Try: gp-wrapper help   (or 'gp-wrapper menu' to pick from the list)" >&2
+      exit 2
+    fi
+    ;;
+esac

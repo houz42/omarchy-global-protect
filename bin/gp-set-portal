@@ -1,0 +1,19 @@
+#!/bin/bash
+# Persists the portal hostname typed into the "Portal" field in the
+# GlobalProtect VPN popup, for bin/globalprotect to read on its next run.
+
+set -eu
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/houz42-global-protect"
+PORTAL_FILE="${CONFIG_DIR}/portal.conf"
+
+portal="${1:-}"
+portal="$(printf '%s' "$portal" | tr -d '[:space:]')"
+
+if [[ -z "$portal" ]]; then
+  echo "gp-set-portal: empty portal" >&2
+  exit 1
+fi
+
+mkdir -p "$CONFIG_DIR"
+printf '%s\n' "$portal" >"$PORTAL_FILE"

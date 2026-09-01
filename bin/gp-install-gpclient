@@ -1,0 +1,20 @@
+#!/bin/bash
+# Interactive installer for gpclient, run in a visible terminal (AUR builds
+# and pacman both need to show output / prompt for confirmation).
+
+set -eu
+
+if command -v gpclient >/dev/null 2>&1; then
+  echo "gpclient is already installed."
+  exit 0
+fi
+
+if command -v yay >/dev/null 2>&1; then
+  exec yay -S globalprotect-openconnect-git
+elif command -v paru >/dev/null 2>&1; then
+  exec paru -S globalprotect-openconnect-git
+else
+  echo "No AUR helper (yay/paru) found. Install one first, then run:"
+  echo "  yay -S globalprotect-openconnect-git"
+  exit 1
+fi

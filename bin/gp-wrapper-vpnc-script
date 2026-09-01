@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Bundled with the houz42.global-protect Omarchy plugin. Install to
+# /etc/vpnc/gp-wrapper-vpnc-script (root-owned) -- this is the fixed
+# --script path the `gp-wrapper` wrapper passes to gpclient.
+#
+# Wrapper around the standard vpnc-script that warns if another tool's exit
+# node/routing setup looks like it could conflict with this VPN tunnel
+# claiming the default route. It never modifies that other tool's state --
+# detection and notification only.
+
+set -u
+
+LOG_TAG=gp-wrapper-hook
+
+log() { logger -t "${LOG_TAG}" -- "$*"; }
+
+warn_on_routing_conflict() {
+  command -v tailscale >/dev/null 2>&1 || return 0
+
+  local current
+  current="$(tailscale debug prefs 2>/dev/null \
+              | sed -nE 's/.*"ExitNodeID":[[:space:]]*"([^"]*)".*/\1/p' \
+              | head -n1)"
+
+  if [[ -n "${current}" ]]; then
+    log "warning: another tool has an active exit-node route (${current}); the default route is about to change"
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -a gp-wrapper -u normal "VPN connecting" \
+        "This will change your default route, which may conflict with another active exit-node route." \
+        2>/dev/null || true
+    fi
+  fi
+}
+
+# Hook BEFORE handing off to the real vpnc-script
+case "${reason:-}" in
+  pre-init|connect)
+    warn_on_routing_conflict
+    ;;
+esac
+
+# Delegate to the standard vpnc-script that openconnect/gp ships with
+exec /etc/vpnc/vpnc-script "$@"

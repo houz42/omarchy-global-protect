@@ -1,0 +1,6 @@
+#!/bin/bash
+# Action handler for the "Disconnect" control in the GlobalProtect VPN popup.
+
+set -u
+BIN_DIR="$(dirname "${BASH_SOURCE[0]}")"
+exec "${BIN_DIR}/gp-wrapper" disconnect

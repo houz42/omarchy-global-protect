@@ -1,0 +1,57 @@
+#!/bin/bash
+# Read-only status collector for the "GlobalProtect VPN" bar-widget plugin.
+# Prints one JSON object describing whether the runtime dependencies/config
+# are in place and the current tunnel state, for Panel.qml to parse. Never
+# mutates state.
+
+set -u
+
+BIN_DIR="$(dirname "${BASH_SOURCE[0]}")"
+GP_WRAPPER="${BIN_DIR}/gp-wrapper"
+HOOK_INSTALL_PATH=/etc/vpnc/gp-wrapper-vpnc-script
+PORTAL_FILE="${XDG_CONFIG_HOME:-${HOME}/.config}/houz42-global-protect/portal.conf"
+
+STATE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/houz42-global-protect"
+LAST_GATEWAY_FILE="${STATE_DIR}/last-gateway"
+
+gpclient_available=false
+vpnc_available=false
+hook_installed=false
+command -v gpclient >/dev/null 2>&1 && gpclient_available=true
+[[ -x /etc/vpnc/vpnc-script ]] && vpnc_available=true
+[[ -f "$HOOK_INSTALL_PATH" ]] && hook_installed=true
+
+portal=""
+[[ -f "$PORTAL_FILE" ]] && portal="$(tr -d '[:space:]' <"$PORTAL_FILE")"
+
+connected=false
+iface=""
+addr=""
+
+if [[ $gpclient_available == true ]]; then
+  first_line="$("$GP_WRAPPER" status 2>/dev/null | head -1)"
+  if [[ $first_line == "GP tunnel UP:"* ]]; then
+    connected=true
+    iface="$(awk '{print $4}' <<<"$first_line")"
+    addr="$(awk '{print $5}' <<<"$first_line")"
+  fi
+fi
+
+last_gateway="$(cat "$LAST_GATEWAY_FILE" 2>/dev/null || true)"
+
+# In-progress action state (idle/discovering/connecting) is NOT reported
+# here -- the panel reads gp-wrapper's action-status file directly via a
+# Quickshell FileView (inotify-backed, instant) instead of polling it
+# through this script, so duplicating it into this JSON would just be a
+# second, independently-staled copy of the same value.
+
+jq -nc \
+  --argjson gpclientAvailable "$gpclient_available" \
+  --argjson vpncAvailable "$vpnc_available" \
+  --argjson hookInstalled "$hook_installed" \
+  --arg portal "$portal" \
+  --argjson connected "$connected" \
+  --arg iface "$iface" \
+  --arg addr "$addr" \
+  --arg lastGateway "$last_gateway" \
+  '{gpclientAvailable: $gpclientAvailable, vpncAvailable: $vpncAvailable, hookInstalled: $hookInstalled, portal: $portal, connected: $connected, iface: $iface, addr: $addr, lastGateway: $lastGateway}'

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Installs this plugin's bundled routing-conflict hook to the fixed path
+# gpclient expects (--script /etc/vpnc/gp-wrapper-vpnc-script), run in a
+# visible terminal since it needs sudo.
+
+set -eu
+
+BIN_DIR="$(dirname "${BASH_SOURCE[0]}")"
+SRC="${BIN_DIR}/gp-wrapper-vpnc-script"
+DEST=/etc/vpnc/gp-wrapper-vpnc-script
+
+sudo install -Dm755 "$SRC" "$DEST"
+echo "Installed ${DEST}"
