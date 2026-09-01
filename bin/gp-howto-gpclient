@@ -1,0 +1,30 @@
+#!/bin/bash
+# Opens a terminal showing the command to install gpclient -- does NOT run
+# it. The user reviews and runs it themselves; this script never execs a
+# package manager itself.
+
+set -eu
+
+if command -v gpclient >/dev/null 2>&1; then
+  echo "gpclient is already installed."
+  echo
+  exec "${SHELL:-bash}"
+fi
+
+echo "gpclient (the GlobalProtect OpenConnect client) is not installed."
+echo
+if command -v yay >/dev/null 2>&1; then
+  echo "Run this yourself when ready:"
+  echo
+  echo "  yay -S globalprotect-openconnect-git"
+elif command -v paru >/dev/null 2>&1; then
+  echo "Run this yourself when ready:"
+  echo
+  echo "  paru -S globalprotect-openconnect-git"
+else
+  echo "No AUR helper (yay/paru) found. Install one first, then run:"
+  echo
+  echo "  yay -S globalprotect-openconnect-git"
+fi
+echo
+exec "${SHELL:-bash}"

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Opens a terminal showing the command to install vpnc -- does NOT run it.
+# The user reviews and runs it themselves; this script never execs a
+# package manager itself.
+
+set -eu
+
+if [[ -x /etc/vpnc/vpnc-script ]]; then
+  echo "vpnc is already installed."
+  echo
+  exec "${SHELL:-bash}"
+fi
+
+echo "vpnc (provides /etc/vpnc/vpnc-script) is not installed."
+echo
+echo "Run this yourself when ready:"
+echo
+echo "  sudo pacman -S --needed vpnc"
+echo
+exec "${SHELL:-bash}"

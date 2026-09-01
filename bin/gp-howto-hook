@@ -1,0 +1,24 @@
+#!/bin/bash
+# Opens a terminal showing the command to install this plugin's bundled
+# routing-conflict hook -- does NOT run it. The user reviews and runs it
+# themselves; this script never execs `sudo install` itself.
+
+set -eu
+
+BIN_DIR="$(dirname "${BASH_SOURCE[0]}")"
+SRC="${BIN_DIR}/gp-wrapper-vpnc-script"
+DEST=/etc/vpnc/gp-wrapper-vpnc-script
+
+if [[ -f "${DEST}" ]]; then
+  echo "Routing hook is already installed at ${DEST}."
+  echo
+  exec "${SHELL:-bash}"
+fi
+
+echo "Routing-conflict hook not installed at ${DEST}."
+echo
+echo "Run this yourself when ready:"
+echo
+echo "  sudo install -Dm755 ${SRC} ${DEST}"
+echo
+exec "${SHELL:-bash}"

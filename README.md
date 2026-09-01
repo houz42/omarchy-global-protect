@@ -19,9 +19,10 @@ is a thin status/button UI around it.
 ## Setup
 
 Click the bar icon to open the popup. If anything below is missing, a
-**Requirements** section lists it with a one-click **Install** button (each
-opens a visible terminal, since AUR builds / pacman / sudo all need to show
-output or prompt for confirmation):
+**Requirements** section lists it with a **Show** button -- opens a
+terminal with the exact command to run, but doesn't run it for you. The
+plugin never execs a package manager or `sudo install` on your behalf;
+you review the command and run it yourself:
 
 1. **`gpclient`** -- the GlobalProtect OpenConnect client the bundled wrapper
    shells out to. Installed from `globalprotect-openconnect-git` (AUR) --

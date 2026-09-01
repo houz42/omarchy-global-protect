@@ -12,7 +12,8 @@ import qs.Ui
 // DNS/IPv6 hardening) lives in bin/gp-wrapper itself -- this plugin is a
 // thin status + button UI around it, not a reimplementation. The only
 // external runtime dependencies are gpclient and the `vpnc` package (see
-// the Requirements section below, with one-click installers).
+// the Requirements section below, each opening a terminal with the exact
+// command to run yourself).
 Panel {
   id: root
   moduleName: "houz42.global-protect"
@@ -335,19 +336,20 @@ Panel {
     setPortalProcess.running = true
   }
 
-  // Each install action runs in a visible terminal (AUR builds, pacman, and
-  // sudo all need to show output / prompt for confirmation), then refreshes
-  // status once the terminal is closed.
+  // Each of these opens a visible terminal showing the exact command to
+  // run -- it does NOT run it. The user reviews and executes it
+  // themselves; the plugin itself never execs a package manager or sudo
+  // install on their behalf. Status refreshes once the terminal is closed.
   function installGpclient() {
-    root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.binDir + "/gp-install-gpclient"))
+    root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.binDir + "/gp-howto-gpclient"))
   }
 
   function installVpnc() {
-    root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.binDir + "/gp-install-vpnc"))
+    root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.binDir + "/gp-howto-vpnc"))
   }
 
   function installHook() {
-    root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.binDir + "/gp-install-hook"))
+    root.bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(root.binDir + "/gp-howto-hook"))
   }
 
   Process {
@@ -599,7 +601,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   visible: !modelData.ok
-                  text: "Install"
+                  text: "Show"
                   fontSize: Style.font.caption
                   foreground: root.foreground
                   fontFamily: root.fontFamily
@@ -614,7 +616,7 @@ Panel {
             Text {
               width: parent.width
               topPadding: Style.space(4)
-              text: "Each Install opens a terminal (sudo / AUR builds need to be visible)."
+              text: "\"Show\" opens a terminal with the command to run -- it won't run it for you."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
