@@ -1,6 +1,6 @@
 #!/bin/bash
 # Persists the portal hostname typed into the "Portal" field in the
-# GlobalProtect VPN popup, for bin/globalprotect to read on its next run.
+# GlobalProtect VPN popup, for bin/gp-wrapper to read on its next run.
 
 set -eu
 
@@ -8,12 +8,23 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/houz42-global-protect"
 PORTAL_FILE="${CONFIG_DIR}/portal.conf"
 
 portal="${1:-}"
-portal="$(printf '%s' "$portal" | tr -d '[:space:]')"
+portal="$(printf '%s' "$portal" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 
-if [[ -z "$portal" ]]; then
-  echo "gp-set-portal: empty portal" >&2
+# Strict hostname shape only (LDH labels separated by dots). The value is
+# later passed verbatim as `gpclient connect <portal>` under sudo --
+# anything looser (a leading dash, embedded junk) would land on gpclient's
+# argv where it could be parsed as a flag instead of a host.
+if [[ ! "$portal" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$ ]]; then
+  echo "gp-set-portal: invalid portal hostname: $portal" >&2
   exit 1
 fi
 
+# Private dir + atomic replace via a same-dir temp file: this file feeds
+# privileged connect invocations, so it must never be a symlink target or
+# a half-written read.
 mkdir -p "$CONFIG_DIR"
-printf '%s\n' "$portal" >"$PORTAL_FILE"
+chmod 700 "$CONFIG_DIR"
+tmp="${PORTAL_FILE}.tmp.$$"
+printf '%s\n' "$portal" >"$tmp"
+chmod 600 "$tmp"
+mv "$tmp" "$PORTAL_FILE"

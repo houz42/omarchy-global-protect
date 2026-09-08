@@ -25,9 +25,16 @@ plugin never execs a package manager or `sudo install` on your behalf;
 you review the command and run it yourself:
 
 1. **`gpclient`** -- the GlobalProtect OpenConnect client the bundled wrapper
-   shells out to. Installed from `globalprotect-openconnect-git` (AUR) --
-   the one with SSO/browser-auth support; the vendor's own GlobalProtect
-   client doesn't support most orgs' SSO login flow.
+   shells out to. From the AUR's `globalprotect-openconnect-git` (the one
+   with SSO/browser-auth support; the vendor's own GlobalProtect client
+   doesn't support most orgs' SSO login flow) -- but **pinned to an
+   immutable upstream release commit**, not whatever `main`-branch HEAD the
+   `-git` PKGBUILD would resolve at build time. The shown commands check
+   out the AUR packaging repo, rewrite its `source=` to
+   `#commit=e98fd7894a2b132fe4cd5ede2c9accc88f54f133` (upstream tag
+   `v2.6.5` of
+   [yuezk/GlobalProtect-openconnect](https://github.com/yuezk/GlobalProtect-openconnect)),
+   and build with `makepkg` -- an exact, re-inspectable revision.
 2. **`vpnc`** (pacman) -- provides `/etc/vpnc/vpnc-script`, which the routing
    hook delegates to.
 3. **The routing hook** -- copies this plugin's bundled
@@ -35,7 +42,9 @@ you review the command and run it yourself:
    fixed path the wrapper passes to `gpclient --script`.
 4. **Your portal hostname** -- type it into the "portal" field in the
    Requirements section and click Save (e.g. `gp.example.com`). Saved to
-   `~/.config/houz42-global-protect/portal.conf`.
+   `~/.config/houz42-global-protect/portal.conf` (config dir `0700`, file
+   `0600`, written atomically; only strict hostname shapes are accepted,
+   since the value is later passed verbatim to `gpclient connect`).
 
 ```bash
 omarchy plugin add https://github.com/houz42/omarchy-global-protect.git --enable
@@ -95,6 +104,17 @@ gateway switch.
 
 A plain `gp-wrapper discover` (rebuild the cached list *without* connecting)
 still exists for CLI use, but the plugin itself no longer calls it.
+
+All runtime files the wrapper writes -- the verbose connect/discover debug
+logs (`connect.log` / `discover.log`, which carry SSO debug output), the
+resume lock, the action-status file -- live in the same user-owned
+`~/.cache/houz42-global-protect/` directory, forced to mode `0700`. Nothing
+is written to shared, predictable `/tmp` paths. The gateway list itself is
+capped and validated (64 entries max, hostname-shaped FQDNs, labels
+truncated to 128 chars and rendered strictly as plain text in the popup),
+and every privileged signal the wrapper sends (`kill -9`, `SIGUSR2`)
+re-verifies the target process's identity (name + start-time + executable)
+immediately beforehand, so a reused PID can never be hit.
 
 ## Settings
 

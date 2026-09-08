@@ -1,7 +1,7 @@
 #!/bin/bash
-# Opens a terminal showing the command to install gpclient -- does NOT run
-# it. The user reviews and runs it themselves; this script never execs a
-# package manager itself.
+# Opens a terminal showing the commands to install gpclient -- does NOT run
+# them. The user reviews and runs them themselves; this script never execs
+# a package manager itself.
 
 set -eu
 
@@ -13,18 +13,17 @@ fi
 
 echo "gpclient (the GlobalProtect OpenConnect client) is not installed."
 echo
-if command -v yay >/dev/null 2>&1; then
-  echo "Run this yourself when ready:"
-  echo
-  echo "  yay -S globalprotect-openconnect-git"
-elif command -v paru >/dev/null 2>&1; then
-  echo "Run this yourself when ready:"
-  echo
-  echo "  paru -S globalprotect-openconnect-git"
-else
-  echo "No AUR helper (yay/paru) found. Install one first, then run:"
-  echo
-  echo "  yay -S globalprotect-openconnect-git"
-fi
+echo "The AUR only ships globalprotect-openconnect-git, whose PKGBUILD"
+echo "builds whatever upstream's main-branch HEAD happens to be at build"
+echo "time. For a credential- and root-sensitive VPN client, pin the build"
+echo "to the immutable upstream release v2.6.5 instead (tag -> commit"
+echo "e98fd7894a2b132fe4cd5ede2c9accc88f54f133, github.com/yuezk/"
+echo "GlobalProtect-openconnect):"
+echo
+echo "  git clone https://aur.archlinux.org/globalprotect-openconnect-git.git"
+echo "  cd globalprotect-openconnect-git"
+echo "  sed -i 's|#branch=main|#commit=e98fd7894a2b132fe4cd5ede2c9accc88f54f133|' PKGBUILD"
+echo "  grep '^source=' PKGBUILD   # verify the pin before building"
+echo "  makepkg -si"
 echo
 exec "${SHELL:-bash}"

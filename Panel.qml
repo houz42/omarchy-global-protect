@@ -68,6 +68,32 @@ Panel {
   // watch the terminal itself (see gp-wrapper's _set_action_status).
   property string action: "idle"
 
+  // Watchdog: absolute deadline for every collector/action Process below.
+  // Without one, a hung child (e.g. gp-gateways on a pathological cache
+  // file) wedges the refresh path forever -- refreshNow()/loadGateways()
+  // early-return while `.running` stays true and nothing ever clears it.
+  // Setting running=false kills the process; its short-lived children
+  // (jq/ip/tr) die with their pipes.
+  component ProcWatchdog: Timer {
+    required property Process target
+    interval: 10000
+    repeat: false
+    running: target.running
+    onTriggered: {
+      console.warn("global-protect: killing hung collector process: " + JSON.stringify(target.command))
+      target.running = false
+    }
+  }
+
+  Component.onDestruction: {
+    statusProcess.running = false
+    gatewaysProcess.running = false
+    sudoCheckProcess.running = false
+    setPortalProcess.running = false
+    disconnectProcess.running = false
+    hardenProcess.running = false
+  }
+
   visible: root.ready
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -211,6 +237,8 @@ Panel {
     }
   }
 
+  ProcWatchdog { target: statusProcess }
+
   function refreshNow() {
     if (statusProcess.running) return
     statusProcess.running = true
@@ -233,6 +261,8 @@ Panel {
     }
   }
 
+  ProcWatchdog { target: gatewaysProcess }
+
   function loadGateways() {
     if (gatewaysProcess.running) return
     gatewaysProcess.running = true
@@ -248,8 +278,33 @@ Panel {
       console.warn("global-protect: gateway list collector printed invalid JSON")
       return
     }
-    if (!Array.isArray(parsed)) return
-    root.gateways = parsed
+    // Schema check, fail closed: this JSON derives from a remote portal's
+    // XML via the gateways.tsv cache. gp-gateways already bounds and
+    // validates it at the producer; this is the second fence. Any element
+    // violating the shape below drops the WHOLE list -- never render
+    // partially-trusted data.
+    if (!Array.isArray(parsed) || parsed.length > 64) {
+      console.warn("global-protect: gateway list failed schema check")
+      return
+    }
+    var clean = []
+    for (var i = 0; i < parsed.length; i++) {
+      var g = parsed[i]
+      if (!g || typeof g.key !== "string" || typeof g.fqdn !== "string" || typeof g.label !== "string") {
+        console.warn("global-protect: gateway entry failed schema check")
+        return
+      }
+      if (g.key.length > 64 || g.fqdn.length > 253 || g.label.length > 128) {
+        console.warn("global-protect: gateway entry exceeds field bounds")
+        return
+      }
+      if (!/^[a-z0-9]+$/.test(g.key) || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(g.fqdn)) {
+        console.warn("global-protect: gateway entry failed charset check")
+        return
+      }
+      clean.push({ key: g.key, fqdn: g.fqdn, label: g.label })
+    }
+    root.gateways = clean
     root.gatewaysLoaded = true
   }
 
@@ -329,6 +384,8 @@ Panel {
     }
   }
 
+  ProcWatchdog { target: sudoCheckProcess }
+
   function runPrivileged(script) {
     if (sudoCheckProcess.running) return
     sudoCheckProcess.pendingScript = script
@@ -370,6 +427,8 @@ Panel {
       onStreamFinished: if (text.trim() !== "") console.warn("global-protect:", text.trim())
     }
   }
+
+  ProcWatchdog { target: setPortalProcess }
 
   function setPortal(value) {
     value = String(value || "").trim()
@@ -413,6 +472,8 @@ Panel {
     }
   }
 
+  ProcWatchdog { target: disconnectProcess }
+
   function disconnect() {
     if (root.busy || disconnectProcess.running) return
     root.busy = true
@@ -437,6 +498,8 @@ Panel {
       onStreamFinished: if (text.trim() !== "") console.warn("global-protect:", text.trim())
     }
   }
+
+  ProcWatchdog { target: hardenProcess }
 
   function harden() {
     if (root.busy || hardenProcess.running || !root.connected) return
@@ -759,6 +822,9 @@ Panel {
 
                   Text {
                     width: parent.width
+                    // Portal-controlled string: plain text only, never let
+                    // AutoText interpret markup in a gateway description.
+                    textFormat: Text.PlainText
                     text: gatewayRow.modelData.label
                     color: gatewayRow.isCurrent ? root.foreground : root.dim
                     font.family: root.fontFamily
@@ -770,6 +836,7 @@ Panel {
                   Text {
                     width: parent.width
                     visible: gatewayRow.isCurrent && root.addr !== ""
+                    textFormat: Text.PlainText
                     text: root.addr
                     color: root.dim
                     font.family: root.fontFamily

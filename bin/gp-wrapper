@@ -63,7 +63,11 @@ if [[ -z "${PORTAL}" && -f "${PORTAL_FILE}" ]]; then
 fi
 
 SCRIPT=/etc/vpnc/gp-wrapper-vpnc-script
-GPSERVICE_PIDFILE=/tmp/gpservice_disconnected.pid
+# Existence of this file is only a HINT that the paid gpgui/gpservice stack
+# paused its tunnel for suspend -- the resume path never reads a PID out of
+# it. A PID/signalling decision must never trust a shared /tmp pathname:
+# any local user can plant or rotate it.
+GPSERVICE_PAUSE_HINT=/tmp/gpservice_disconnected.pid
 GPCLIENT_LOCK=/var/run/gpclient.lock
 # Persistent portal cookie cache. gpclient runs as root (via sudo), so this
 # root-owned path keeps a reusable gateway auth_cookie: reconnects skip the SAML
@@ -75,7 +79,20 @@ COOKIE_CACHE=/var/cache/gpclient/cookie.json
 # reconnect to (gpclient's picker needs a TTY; resume has none).
 STATE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/houz42-global-protect"
 LAST_GATEWAY_FILE="${STATE_DIR}/last-gateway"
-RESUME_LOCK=/tmp/gp-wrapper-resume.lock
+# Runtime files (connect/discover debug logs, resume lock) live under
+# STATE_DIR, forced to 0700 -- never under shared /tmp: predictable /tmp
+# names are symlink-raceable, land world-readable under a default umask,
+# and these logs carry RUST_LOG=debug SSO output (auth URLs, portal
+# responses). The lock deliberately does NOT use ${XDG_RUNTIME_DIR}: the
+# system-sleep hook runs `gp-wrapper resume` via `su -l`, which has no
+# XDG_RUNTIME_DIR, so the lock would resolve differently in exactly the
+# two contexts it exists to serialize against each other.
+RESUME_LOCK="${STATE_DIR}/resume.lock"
+
+_ensure_state_dir() {
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  chmod 700 "${STATE_DIR}" 2>/dev/null || true
+}
 
 # In-progress action, for the plugin panel to show live status/icon state
 # without needing a terminal for visibility (`idle|discovering|connecting`,
@@ -84,7 +101,7 @@ RESUME_LOCK=/tmp/gp-wrapper-resume.lock
 # "Connecting..." forever.
 ACTION_STATUS_FILE="${STATE_DIR}/action-status"
 _set_action_status() {
-  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  _ensure_state_dir
   printf '%s %s\n' "$(date +%s)" "${1}" >"${ACTION_STATUS_FILE}.tmp" 2>/dev/null \
     && mv "${ACTION_STATUS_FILE}.tmp" "${ACTION_STATUS_FILE}" 2>/dev/null || true
 }
@@ -120,6 +137,7 @@ _watch_connect_status() {
       if _tunnel_alive; then
         if [[ -n "${log}" ]]; then
           actual_gw="$(command grep -oE 'SSL negotiation with [A-Za-z0-9.-]+' "${log}" 2>/dev/null | tail -1 | awk '{print $NF}')"
+          actual_gw="${actual_gw:0:253}"
           if [[ -n "${actual_gw}" ]]; then
             _persist_gateway "${actual_gw}"
             # Cookie-reuse can also skip the portal config fetch entirely,
@@ -129,7 +147,7 @@ _watch_connect_status() {
             # or a future cookie-expired connect-auto will overwrite it
             # with the full, properly-labeled list.
             if [[ ! -s "${GATEWAYS_FILE}" ]]; then
-              mkdir -p "${STATE_DIR}"
+              _ensure_state_dir
               printf '%s|%s|%s\n' "${actual_gw//./}" "${actual_gw}" "${actual_gw}" >"${GATEWAYS_FILE}"
             fi
           fi
@@ -177,9 +195,18 @@ _load_gateways() {
 _load_gateways
 
 _require_portal() {
+  PORTAL="$(printf '%s' "${PORTAL}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
   if [[ -z "${PORTAL}" ]]; then
     echo "gp-wrapper: no portal configured. Set \$GP_PORTAL or write your portal" >&2
     echo "hostname to ${PORTAL_FILE} (one line, e.g. gp.example.com)." >&2
+    exit 1
+  fi
+  # Strict hostname shape only (LDH labels separated by dots). The value is
+  # passed verbatim as `gpclient connect <portal>` -- anything looser (a
+  # leading dash, embedded junk) would land on gpclient's argv where it
+  # could be parsed as a flag instead of a host.
+  if [[ ! "${PORTAL}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$ ]]; then
+    echo "gp-wrapper: invalid portal hostname: ${PORTAL}" >&2
     exit 1
   fi
 }
@@ -322,13 +349,28 @@ _save_gateways() {
   # desc, i.e. clicking one gateway could silently connect to a different
   # one. Strip it rather than support escaping a format nothing else here
   # needs to be more expressive than "a label".
-  local fqdn desc key
-  mkdir -p "${STATE_DIR}"
+  #
+  # Bounded: cap entry count and field lengths, and only accept
+  # hostname-shaped FQDNs. The source is a remote portal's XML transiting a
+  # debug log, so treat it as hostile input even on its way into a
+  # user-local cache file.
+  local fqdn desc key count=0
+  _ensure_state_dir
   {
     while IFS='|' read -r fqdn desc; do
+      if (( count >= 64 )); then
+        break
+      fi
+      if [[ ! "${fqdn}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]; then
+        continue
+      fi
       desc="${desc//|/ }"
+      desc="${desc:0:128}"
+      [[ -z "${desc}" ]] && continue
       key="$(printf '%s' "${desc}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+//g')"
+      [[ -z "${key}" ]] && continue
       printf '%s|%s|%s\n' "${key}" "${desc}" "${fqdn}"
+      (( count += 1 ))
     done
   } >"${GATEWAYS_FILE}.tmp"
   mv "${GATEWAYS_FILE}.tmp" "${GATEWAYS_FILE}"
@@ -376,7 +418,7 @@ _persist_gateway() {
   # Record the last-connected gateway FQDN so `gp-wrapper resume` (non-TTY) can
   # reconnect to the same gateway without the interactive picker.
   local gw="${1}"
-  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  _ensure_state_dir
   printf '%s\n' "${gw}" > "${LAST_GATEWAY_FILE}" 2>/dev/null || true
 }
 
@@ -475,15 +517,50 @@ _tunnel_alive() {
   return 1
 }
 
+_pid_starttime() {
+  # _pid_starttime <pid> -> process start-time (jiffies, field 22 of
+  # /proc/<pid>/stat). comm (field 2) is parenthesized and may itself
+  # contain spaces/parens, so split on the LAST ") " rather than whitespace.
+  local rest
+  rest="$(cat "/proc/${1}/stat" 2>/dev/null)" || return 1
+  rest="${rest##*) }"
+  # The strip removes "pid (comm) " -- 2 fields, NOT 3: the remainder begins
+  # at state (field 3), so starttime (field 22) is the 20th word. Verified
+  # against `awk '{print $22}'` on a live process.
+  # shellcheck disable=SC2086
+  set -- ${rest}
+  [[ -n "${20:-}" ]] || return 1
+  printf '%s\n' "${20}"
+}
+
+_sig_verified() {
+  # _sig_verified <pid> <expected-comm> <expected-starttime> <signal>
+  # Privileged signals (kill -9 / SIGUSR2 via sudo) are TOCTOU-prone: a bare
+  # PID can be reused by an unrelated process between lookup and signal, and
+  # /proc/<pid>/comm alone is spoofable (prctl). Re-verify the FULL identity
+  # -- comm, start-time, and exe basename -- immediately before signalling,
+  # and skip silently on any mismatch. Callers capture the identity at
+  # lookup time and pass it in.
+  local pid="${1}" comm="${2}" st="${3}" sig="${4}" exe
+  [[ -n "${st}" ]] || return 1
+  [[ "$(cat "/proc/${pid}/comm" 2>/dev/null)" == "${comm}" ]] || return 1
+  [[ "$(_pid_starttime "${pid}")" == "${st}" ]] || return 1
+  exe="$(sudo readlink "/proc/${pid}/exe" 2>/dev/null)" || return 1
+  [[ "${exe##*/}" == "${comm}"* ]] || return 1
+  sudo kill -"${sig}" "${pid}" 2>/dev/null || true
+}
+
 _kill_stale_gpclient() {
   # After a clean `gpclient disconnect`, if a stale connect process still holds
-  # /var/run/gpclient.lock, kill it (guarded by /proc/<pid>/comm to avoid PID
-  # reuse) and remove the lock so a fresh connect won't hit "already running".
-  local pid
+  # /var/run/gpclient.lock, kill it and remove the lock so a fresh connect
+  # won't hit "already running". The PID is captured WITH its start-time and
+  # re-verified right before the signal, so a reused PID can never be hit.
+  local pid st
   [[ -f "${GPCLIENT_LOCK}" ]] || return 0
   pid="$(sudo cat "${GPCLIENT_LOCK}" 2>/dev/null | tr -dc '0-9')"
   if [[ -n "${pid}" ]] && grep -qi gpclient "/proc/${pid}/comm" 2>/dev/null; then
-    sudo kill -9 "${pid}" 2>/dev/null || true
+    st="$(_pid_starttime "${pid}" || true)"
+    _sig_verified "${pid}" gpclient "${st}" 9 || true
     sleep 1
   fi
   # Remove the lock only if no live gpclient still owns it.
@@ -638,7 +715,7 @@ _ensure_single_session() {
   # the instant we `exec sudo gpclient` and would protect nothing. Checking for
   # a live process is the reliable equivalent.
   local target="${1:-}"
-  local pids i p cur
+  local pids i p cur _st
   pids="$(_live_gpclient_pids | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
   [[ -z "${pids}" ]] && return 0
 
@@ -660,9 +737,8 @@ _ensure_single_session() {
     sleep 0.5
   done
   for p in $(_live_gpclient_pids); do          # anything left is wedged: reap it
-    if grep -qi gpclient "/proc/${p}/comm" 2>/dev/null; then
-      sudo kill -9 "${p}" 2>/dev/null || true
-    fi
+    _st="$(_pid_starttime "${p}" || true)"
+    _sig_verified "${p}" gpclient "${_st}" 9 || true
   done
   _kill_stale_gpclient
   # Never connect while a tunnel device lingers: a new session inheriting a
@@ -768,8 +844,10 @@ case "${cmd}" in
     # doesn't need a separate discovery step to have run first.
     _require_portal
     _ensure_single_session ""
-    log=/tmp/gp-wrapper-connect.log
+    _ensure_state_dir
+    log="${STATE_DIR}/connect.log"
     : >"${log}"
+    chmod 600 "${log}" 2>/dev/null || true
     _ensure_cookie_cache_dir
     _harden_when_up
     _set_action_status connecting
@@ -815,10 +893,13 @@ case "${cmd}" in
       done
     fi
     echo "Triggering portal config fetch (browser may open for SAML)..." >&2
-    log=/tmp/gp-wrapper-discover.log
+    _ensure_state_dir
+    log="${STATE_DIR}/discover.log"
     # The redirect intentionally runs in THIS (unprivileged) shell, not as
     # root -- the log needs to stay readable by the calling user without
-    # sudo, since it's parsed straight back below in the same script.
+    # sudo, since it's parsed straight back below in the same script. It
+    # lives in the user-owned 0700 STATE_DIR (never shared /tmp), since the
+    # RUST_LOG=debug content includes SSO/auth material.
     # shellcheck disable=SC2024
     sudo RUST_LOG=debug gpclient -vv connect "${PORTAL}" \
         --script "${SCRIPT}" \
@@ -926,14 +1007,19 @@ case "${cmd}" in
     fi
 
     # (1) Fast path: paid gpgui/gpservice stack paused the tunnel on sleep.
-    # Only valid if gpservice is ACTUALLY running (bare CLI never writes this).
-    if [[ -f "${GPSERVICE_PIDFILE}" ]]; then
-      pid="$(cat "${GPSERVICE_PIDFILE}" 2>/dev/null)"
-      if [[ -n "${pid}" ]] && ps -p "${pid}" -o comm= 2>/dev/null | grep -q gpservice; then
-        sudo rm -f "${GPSERVICE_PIDFILE}"
-        sudo kill -USR2 "${pid}" 2>/dev/null || true
-        _notify low "VPN resuming" "Sent SIGUSR2 to gpservice (pid ${pid})"
-        exit 0
+    # The /tmp file's EXISTENCE is the "paused" hint; its CONTENTS are never
+    # trusted (any local user can plant it). Resolve gpservice's PID from
+    # /proc by name instead, capture its start-time, and re-verify the full
+    # identity immediately before signalling.
+    if [[ -f "${GPSERVICE_PAUSE_HINT}" ]]; then
+      pid="$(pgrep -xo gpservice 2>/dev/null || true)"
+      if [[ -n "${pid}" ]]; then
+        st="$(_pid_starttime "${pid}" || true)"
+        sudo rm -f "${GPSERVICE_PAUSE_HINT}"
+        if _sig_verified "${pid}" gpservice "${st}" USR2; then
+          _notify low "VPN resuming" "Sent SIGUSR2 to gpservice (pid ${pid})"
+          exit 0
+        fi
       fi
     fi
 
