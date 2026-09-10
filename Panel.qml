@@ -62,11 +62,27 @@ Panel {
   property string addr: ""
   property string lastGateway: ""
   property bool busy: false
+  // Optimistic latch set the instant a connect is LAUNCHED from this panel.
+  // gp-wrapper only writes action-status=connecting once it is actually
+  // running -- after the sudo check and, on the password path, after the
+  // user finishes typing it in the terminal -- so without this the switch
+  // looks idle (and accepts more clicks, each launching another gp-wrapper
+  // that fights the first over the singleton session) for the whole
+  // prompt/startup span. Cleared when a status poll reports connected, when
+  // the wrapper's action status falls back to idle (success, failure, or
+  // its own timeout), or by pendingWatchdog if the wrapper never even
+  // started (e.g. the sudo terminal was closed without a password).
+  property bool connectPending: false
   // "idle" | "discovering" | "connecting" -- written by gp-wrapper to a
   // state file gp-status reads back, so the panel can show live progress
   // for the terminal-driven discover/connect flow without needing to
   // watch the terminal itself (see gp-wrapper's _set_action_status).
   property string action: "idle"
+  // Any in-flight mutation the switch must freeze and dim for: a panel-
+  // launched connect (pending + wrapper-reported), a disconnect (busy), or
+  // a wrapper action launched from a terminal (action !== idle with no
+  // local pending). Single point every guard and visual below binds to.
+  readonly property bool transitioning: root.busy || root.connectPending || root.action !== "idle"
 
   // Watchdog: absolute deadline for every collector/action Process below.
   // Without one, a hung child (e.g. gp-gateways on a pathological cache
@@ -116,7 +132,7 @@ Panel {
     if (!root.requirementsMet) return "Setup needed"
     if (root.busy) return "Working..."
     if (root.action === "discovering") return "Discovering gateways..."
-    if (root.action === "connecting") return "Connecting..."
+    if (root.connectPending || root.action === "connecting") return "Connecting..."
     return root.connected ? "Connected" : "Disconnected"
   }
 
@@ -210,15 +226,37 @@ Panel {
 
   function applyActionStatus(content) {
     var trimmed = String(content || "").trim()
-    if (trimmed === "") { root.action = "idle"; return }
-    var parts = trimmed.split(/\s+/)
-    var ts = parseInt(parts[0], 10)
-    var word = parts[1] || "idle"
-    if (!isFinite(ts) || (Date.now() / 1000 - ts) > 200) {
-      root.action = "idle"
-      return
+    var word = "idle"
+    if (trimmed !== "") {
+      var parts = trimmed.split(/\s+/)
+      var ts = parseInt(parts[0], 10)
+      if (isFinite(ts) && (Date.now() / 1000 - ts) <= 200) word = parts[1] || "idle"
     }
+    var wasActive = root.action !== "idle"
     root.action = word
+    if (word === "idle") {
+      // The wrapper finished one way or the other (tunnel up, failed, or
+      // hit its own bound), so the launch latch is done either way. Pull a
+      // fresh status right now instead of waiting out the poll interval:
+      // on success the panel flips to Connected within a second instead of
+      // up to refreshIntervalSec later; on failure it confirms the switch
+      // should fall back to off.
+      root.connectPending = false
+      pendingWatchdog.stop()
+      if (wasActive) root.refreshNow()
+    }
+  }
+
+  // Last-resort clear for connectPending when the wrapper NEVER reports
+  // (sudo terminal closed without a password, wrapper killed before it
+  // could write). Generous bound: a legit run writes action-status within
+  // seconds of launch, and once it has, action !== idle keeps the switch
+  // frozen on its own -- this timer firing mid-connect is invisible.
+  Timer {
+    id: pendingWatchdog
+    interval: 5 * 60 * 1000
+    repeat: false
+    onTriggered: root.connectPending = false
   }
 
   Process {
@@ -329,6 +367,10 @@ Panel {
       firstRunFocusTimer.restart()
     }
     root.connected = payload.connected === true
+    if (root.connected) {
+      root.connectPending = false
+      pendingWatchdog.stop()
+    }
     root.iface = String(payload.iface || "")
     root.addr = String(payload.addr || "")
     root.lastGateway = String(payload.lastGateway || "")
@@ -346,7 +388,7 @@ Panel {
   }
 
   function toggleDefault() {
-    if (root.busy) return
+    if (root.transitioning) return
     if (root.connected) {
       root.disconnect()
       return
@@ -390,10 +432,13 @@ Panel {
     if (sudoCheckProcess.running) return
     sudoCheckProcess.pendingScript = script
     sudoCheckProcess.running = true
+    // Only connect flows reach here (connectGateway / discoverAndConnect).
+    root.connectPending = true
+    pendingWatchdog.restart()
   }
 
   function connectGateway(key) {
-    if (root.busy || !root.requirementsMet) return
+    if (root.transitioning || !root.requirementsMet) return
     var script = "GP_PORTAL=" + Util.shellQuote(root.portal) + " "
       + Util.shellQuote(root.binDir + "/gp-wrapper") + " " + Util.shellQuote(key)
     root.runPrivileged(script)
@@ -405,7 +450,7 @@ Panel {
   // session) whose own verbose log also gets parsed in the background to
   // (re)populate the cached gateway list -- see gp-wrapper's `connect-auto`.
   function discoverAndConnect() {
-    if (root.busy || !root.requirementsMet) return
+    if (root.transitioning || !root.requirementsMet) return
     var script = "GP_PORTAL=" + Util.shellQuote(root.portal) + " "
       + Util.shellQuote(root.binDir + "/gp-wrapper") + " connect-auto"
     root.runPrivileged(script)
@@ -475,7 +520,7 @@ Panel {
   ProcWatchdog { target: disconnectProcess }
 
   function disconnect() {
-    if (root.busy || disconnectProcess.running) return
+    if (root.transitioning || disconnectProcess.running) return
     root.busy = true
     disconnectProcess.running = true
   }
@@ -487,10 +532,7 @@ Panel {
 
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        root.busy = false
-        root.refreshNow()
-      }
+      onStreamFinished: root.refreshNow()
     }
 
     stderr: StdioCollector {
@@ -501,9 +543,12 @@ Panel {
 
   ProcWatchdog { target: hardenProcess }
 
+  // Deliberately does NOT set root.busy: this is an idempotent background
+  // re-check (see the timer comment below), so it must not freeze/dim the
+  // switch or flash "Working..." for a second every 5 minutes. busy is for
+  // user-invoked state changes -- disconnect -- only.
   function harden() {
-    if (root.busy || hardenProcess.running || !root.connected) return
-    root.busy = true
+    if (root.transitioning || hardenProcess.running || !root.connected) return
     hardenProcess.running = true
   }
 
@@ -528,7 +573,9 @@ Panel {
     bar: root.bar
     foreground: root.connected ? root.foreground : root.dim
     text: ""
-    tooltipText: "GlobalProtect VPN: " + (root.connected ? "Connected" : "Disconnected")
+    tooltipText: "GlobalProtect VPN: " + (root.connected
+      ? "Connected"
+      : (root.connectPending || root.action !== "idle" ? "Connecting..." : "Disconnected"))
     onPressed: function(buttonCode) {
       root.toggle()
     }
@@ -590,19 +637,29 @@ Panel {
                   anchors.centerIn: parent
                   checked: root.connected
                   foreground: root.foreground
-                  busy: root.busy
+                  // Frozen + shadowed for the whole startup span: busy
+                  // swallows further clicks (each would otherwise launch
+                  // another gp-wrapper fighting over the singleton
+                  // session) and the dim reads as "starting, wait" -- the
+                  // hero meta says "Connecting..." alongside it.
+                  busy: root.transitioning
+                  opacity: root.transitioning ? 0.45 : 1.0
                   interactive: root.connected || root.requirementsMet
                   onToggled: root.toggleDefault()
+
+                  Behavior on opacity { NumberAnimation { duration: 120 } }
 
                   onContainsMouseChanged: if (containsMouse) root.setCursor(0)
 
                   PanelToolTip {
                     visible: parent.containsMouse
-                    text: root.connected
-                      ? "Disconnect"
-                      : (root.defaultGatewayKey() !== ""
-                          ? "Connect to " + root.gatewayLabelForKey(root.defaultGatewayKey())
-                          : "Discover gateways and connect")
+                    text: root.transitioning
+                      ? (root.busy ? "Working..." : "Connecting...")
+                      : (root.connected
+                          ? "Disconnect"
+                          : (root.defaultGatewayKey() !== ""
+                              ? "Connect to " + root.gatewayLabelForKey(root.defaultGatewayKey())
+                              : "Discover gateways and connect"))
                     fontFamily: root.fontFamily
                   }
                 }
@@ -760,15 +817,15 @@ Panel {
               PanelActionButton {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                iconText: ""
-                tooltipText: root.action !== "idle" ? "Connecting..." : "Discover gateways from the portal and connect (~15-25s)"
+                iconText: ""
+                tooltipText: (root.connectPending || root.action !== "idle") ? "Connecting..." : "Discover gateways from the portal and connect (~15-25s)"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                enabled: root.action === "idle"
+                enabled: root.action === "idle" && !root.connectPending
                 onClicked: root.discoverAndConnect()
 
                 RotationAnimation on rotation {
-                  running: root.action !== "idle"
+                  running: root.action !== "idle" || root.connectPending
                   loops: Animation.Infinite
                   from: 0
                   to: 360
@@ -790,6 +847,11 @@ Panel {
             ListView {
               id: gatewayList
               visible: root.gateways.length > 0
+              // Rows launch the same connect/disconnect the switch does, so
+              // they freeze with it -- clicks are already guarded inside
+              // connectGateway/disconnect; this just shows it.
+              opacity: root.transitioning ? 0.55 : 1.0
+              Behavior on opacity { NumberAnimation { duration: 120 } }
               width: parent.width
               height: Math.min(contentHeight, Style.space(200))
               spacing: Style.space(2)
