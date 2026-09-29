@@ -109,7 +109,14 @@ All runtime files the wrapper writes -- the verbose connect/discover debug
 logs (`connect.log` / `discover.log`, which carry SSO debug output), the
 resume lock, the action-status file -- live in the same user-owned
 `~/.cache/houz42-global-protect/` directory, forced to mode `0700`. Nothing
-is written to shared, predictable `/tmp` paths. The gateway list itself is
+is written to shared, predictable `/tmp` paths. The debug logs are captured
+through a sink with a hard byte ceiling (256 KiB) that keeps draining past
+the cap, so a flooding or malfunctioning portal can neither grow a log
+until the disk fills nor stall/kill the long-lived `gpclient` writing it;
+and the logs are deleted once parsing/connect resolution is done with them
+(success or failure) instead of being kept around -- set `GP_KEEP_DEBUG=1`
+when running `gp-wrapper discover` by hand to retain `discover.log` for
+inspection. The gateway list itself is
 capped and validated (64 entries max, hostname-shaped FQDNs, labels
 truncated to 128 chars and rendered strictly as plain text in the popup),
 and every privileged signal the wrapper sends (`kill -9`, `SIGUSR2`)

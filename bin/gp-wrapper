@@ -89,9 +89,41 @@ LAST_GATEWAY_FILE="${STATE_DIR}/last-gateway"
 # two contexts it exists to serialize against each other.
 RESUME_LOCK="${STATE_DIR}/resume.lock"
 
+# Hard byte ceiling for the RUST_LOG=debug gpclient output captured to
+# connect.log/discover.log. The remote portal influences that stream, so it
+# must never grow unbounded: 256 KiB covers the parse-relevant prefix with
+# wide margin (the portal's gateway config and the "SSL negotiation with"
+# line both arrive within the first seconds, before the tunnel comes up);
+# past the cap the stream is discarded, which under a flooding portal
+# degrades only gateway-list caching, never the tunnel itself.
+# Overridable for tests.
+GP_DEBUG_LOG_CAP="${GP_DEBUG_LOG_CAP:-262144}"
+
 _ensure_state_dir() {
   mkdir -p "${STATE_DIR}" 2>/dev/null || true
   chmod 700 "${STATE_DIR}" 2>/dev/null || true
+}
+
+# _cap_log_sink <file>: stdin -> <file>, capped at GP_DEBUG_LOG_CAP bytes,
+# then keeps draining stdin to /dev/null forever. Both halves matter: the
+# cap bounds the file against a flooding or malicious portal, and the drain
+# keeps the producer (gpclient, potentially a whole VPN session) from ever
+# blocking on a full pipe or dying to SIGPIPE once the cap trips. `head -c`
+# never reads past the cap, and the group's shared stdin keeps a reader
+# attached between the two commands, so the producer never sees EPIPE.
+_cap_log_sink() {
+  local file="${1}"
+  head -c "${GP_DEBUG_LOG_CAP}" >"${file}" 2>/dev/null || true
+  cat >/dev/null 2>&1 || true
+}
+
+# _remove_debug_log <file>: debug material (SSO URLs, portal responses) is
+# removed once its consumers are done with it -- after gateway parsing, on
+# connect resolution, and on failure -- not retained in the persistent
+# cache. GP_KEEP_DEBUG=1 opts out for manual debugging (hand-run `discover`).
+_remove_debug_log() {
+  [[ "${GP_KEEP_DEBUG:-0}" == "1" ]] && return 0
+  rm -f "${1}" 2>/dev/null || true
 }
 
 # In-progress action, for the plugin panel to show live status/icon state
@@ -152,6 +184,14 @@ _watch_connect_status() {
             fi
           fi
         fi
+        # This watcher is the last consumer of the connect log (the
+        # gateway-list parser above finishes within its own 30s window);
+        # the debug material is not retained past connect resolution.
+        # Benign forfeit: if the tunnel comes up before the portal config
+        # arrived (fast cached-cookie reconnect), the parser may lose the
+        # file mid-window and skip caching the list this round -- it
+        # self-heals on the next full-SSO connect.
+        [[ -n "${log}" ]] && _remove_debug_log "${log}"
         _set_action_status idle
         exit 0
       fi
@@ -166,12 +206,14 @@ _watch_connect_status() {
       if [[ -n "$(_live_gpclient_pids)" ]]; then
         seen_gpclient=1
       elif [[ -n "${seen_gpclient}" ]]; then
+        [[ -n "${log}" ]] && _remove_debug_log "${log}"
         _set_action_status idle
         _notify critical "VPN connect failed" "gpclient exited before the tunnel came up."
         exit 0
       fi
       sleep 1
     done
+    [[ -n "${log}" ]] && _remove_debug_log "${log}"
     _set_action_status idle
     _notify critical "VPN connect timed out" "No tunnel after 15 minutes."
   ) >/dev/null 2>&1 &
@@ -861,11 +903,19 @@ case "${cmd}" in
       [[ -n "${parsed}" ]] && _save_gateways <<<"${parsed}"
     ) >/dev/null 2>&1 &
     disown 2>/dev/null || true
+    # The debug stream goes through a capped sink, not a bare redirect: at
+    # most GP_DEBUG_LOG_CAP bytes ever land in the log, and the rest is
+    # drained to /dev/null so this potentially days-long session stream can
+    # neither grow the file (disk exhaustion via a flooding portal) nor
+    # block/SIGPIPE gpclient (which would kill the VPN itself). The exec
+    # still replaces this wrapper with sudo/gpclient; the sink is a detached
+    # reader that exits on EOF when the session ends. The log is removed by
+    # _watch_connect_status once the connect resolves or fails.
     exec sudo RUST_LOG=debug gpclient -vv connect "${PORTAL}" \
       --script "${SCRIPT}" \
       --cookie-cache "${COOKIE_CACHE}" \
       --default-browser \
-      --auto-gateway >"${log}" 2>&1
+      --auto-gateway > >( _cap_log_sink "${log}" ) 2>&1
     ;;
   discover)
     # Live portal fetch: triggers a real SAML/SSO browser round-trip under
@@ -895,15 +945,19 @@ case "${cmd}" in
     echo "Triggering portal config fetch (browser may open for SAML)..." >&2
     _ensure_state_dir
     log="${STATE_DIR}/discover.log"
-    # The redirect intentionally runs in THIS (unprivileged) shell, not as
+    : >"${log}"
+    chmod 600 "${log}" 2>/dev/null || true
+    # The sink intentionally runs in THIS (unprivileged) shell, not as
     # root -- the log needs to stay readable by the calling user without
     # sudo, since it's parsed straight back below in the same script. It
     # lives in the user-owned 0700 STATE_DIR (never shared /tmp), since the
-    # RUST_LOG=debug content includes SSO/auth material.
+    # RUST_LOG=debug content includes SSO/auth material. The sink caps the
+    # file at GP_DEBUG_LOG_CAP bytes and drains the rest, so even a portal
+    # flooding debug output for the whole 25s window cannot fill the disk.
     # shellcheck disable=SC2024
     sudo RUST_LOG=debug gpclient -vv connect "${PORTAL}" \
         --script "${SCRIPT}" \
-        --default-browser >"${log}" 2>&1 &
+        --default-browser > >( _cap_log_sink "${log}" ) 2>&1 &
     pid=$!
     # gpclient logs the parsed gateway count as soon as the portal config
     # arrives, then blocks on its own interactive "which gateway?" picker
@@ -920,12 +974,24 @@ case "${cmd}" in
     sudo kill -INT "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
 
+    # FIFO ordering through the cap sink makes this race-free: the marker
+    # line was grepped IN the file, so every byte before it -- the <entry>/
+    # <description> pairs being parsed here -- has already been flushed to
+    # the file; the kill can only cut off post-marker bytes, which the
+    # parser does not need.
     parsed="$(_extract_gateways_from_log "${log}")"
+    # Debug material (SSO URLs, portal responses) is removed after parsing,
+    # on success AND on failure -- not retained in the persistent cache.
+    _remove_debug_log "${log}"
 
     if [[ -z "${parsed}" ]]; then
       echo "gp-wrapper: could not parse any gateways from the portal response." >&2
-      echo "Full debug log: ${log}" >&2
-      echo "Look for: <entry name=\"<FQDN>\"> and <description>...</description>" >&2
+      if [[ "${GP_KEEP_DEBUG:-0}" == "1" ]]; then
+        echo "Debug log kept at: ${log}" >&2
+        echo "Look for: <entry name=\"<FQDN>\"> and <description>...</description>" >&2
+      else
+        echo "Debug log was removed (SSO material is not retained). Re-run with GP_KEEP_DEBUG=1 to keep it at ${log}." >&2
+      fi
       _set_action_status idle
       exit 1
     fi
